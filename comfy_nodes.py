@@ -328,10 +328,10 @@ class SimpleINT4UNetLoader:
             "required": {
                 "unet_name": (_get_diffusion_model_list(),),
                 "model_type": (["flux", "wan", "zimage", "chroma", "default"], {"default": "flux"}),
-                "rot_size": ([0, 16, 64, 256], {"default": 0}),
+                "rot_size": ([0, 16, 64, 256], {"default": 256}),
             },
             "optional": {
-                "use_pytorch": ("BOOLEAN", {"default": True}),
+                "use_pytorch": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -439,6 +439,7 @@ if _COMFY_OPS_AVAILABLE:
         _rot_size_override = 0
         _is_gptq = False
         _debug_shapes = False
+        _perm_count = 0
 
         class Linear(manual_cast.Linear):
 
@@ -479,6 +480,7 @@ if _COMFY_OPS_AVAILABLE:
 
                         if perm_key in state_dict:
                             self._perm = state_dict[perm_key].to(torch.int64)
+                            IntCrushInt8Ops._perm_count += 1
 
                         bias_key = prefix + "bias"
                         if bias_key in state_dict:
@@ -701,7 +703,7 @@ class SimpleINT8UNetLoader:
             "required": {
                 "unet_name": (_get_diffusion_model_list(),),
                 "model_type": (["flux", "wan", "zimage", "chroma", "default"], {"default": "flux"}),
-                "rot_size": ([0, 16, 64, 256], {"default": 0}),
+                "rot_size": ([0, 16, 64, 256], {"default": 256}),
             },
             "optional": {
                 "debug_shapes": ("BOOLEAN", {"default": False}),
@@ -752,6 +754,10 @@ class SimpleINT8UNetLoader:
         IntCrushInt8Ops._debug_shapes = debug_shapes
         model_options = {"custom_operations": IntCrushInt8Ops}
         model = load_diffusion_model(unet_path, model_options=model_options)
+
+        if IntCrushInt8Ops._perm_count > 0:
+            print(f"[INT-Crush] INT8: PermuQuant: {IntCrushInt8Ops._perm_count} layers with channel permutations")
+        IntCrushInt8Ops._perm_count = 0
 
         # Fix model config for padded layers.
         # ComfyUI reads in_channels from img_in.weight.shape[1], but rotation
