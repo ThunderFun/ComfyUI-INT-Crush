@@ -1,6 +1,6 @@
 # ComfyUI-INT-Crush
 
-ComfyUI loader for INT-Crush quantized models (INT4 + INT8). Supports model quantized with [INT-Crush Converter](https://github.com/ThunderFun/int_crush_converter)
+ComfyUI loader for INT-Crush quantized models (INT4 + INT8). Supports models quantized with [INT-Crush Converter](https://github.com/ThunderFun/int_crush_converter)
 
 > **⚠️ WARNING:** This code has not been thoroughly tested.
 
