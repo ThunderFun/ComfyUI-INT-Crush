@@ -18,6 +18,9 @@ from ._quant_utils import (
 _TRITON_AVAILABLE = False
 _TRITON_INT4_UNPACK = False
 _TRITON_W4A16_GEMM = False
+_TRITON_INT8_GEMM = False
+_TRITON_INT4_INT8_UNPACK = False
+_TRITON_DYNQUANT = False
 try:
     from .kernels.triton_int4_unpack import unpack_int4_to_float16
     _TRITON_INT4_UNPACK = True
@@ -31,6 +34,29 @@ try:
     print("[INT-Crush] Triton fused W4A16 GEMM loaded")
 except Exception as e:
     print(f"[INT-Crush] Triton W4A16 GEMM not available: {e}")
+
+try:
+    from .kernels.triton_quantize import dynamic_quantize_activation
+    _TRITON_DYNQUANT = True
+except Exception:
+    pass
+
+try:
+    from .kernels.triton_int8_gemm import fused_int8_gemm_dequant
+    _TRITON_INT8_GEMM = True
+except Exception:
+    pass
+
+try:
+    from .kernels.triton_int4_to_int8_unpack import unpack_int4_to_int8
+    _TRITON_INT4_INT8_UNPACK = True
+except Exception:
+    pass
+
+if _TRITON_INT8_GEMM and _TRITON_DYNQUANT:
+    print("[INT-Crush] Triton INT8 GEMM + dynamic quantizer loaded")
+if _TRITON_INT4_INT8_UNPACK:
+    print("[INT-Crush] Triton INT4->INT8 unpack kernel loaded")
 
 try:
     from comfy.ops import manual_cast
@@ -81,7 +107,7 @@ if _COMFY_OPS_AVAILABLE:
 
         _rot_size_override = 0
         _is_gptq = False
-        _use_pytorch = True  # Default to PyTorch fallback path
+        _use_w4a8 = True  # Default to W4A8 IMMA path
         _perm_count = 0
 
         class Linear(manual_cast.Linear):
@@ -265,10 +291,33 @@ if _COMFY_OPS_AVAILABLE:
                 if self._perm is not None:
                     x_rot = x_rot[..., self._perm.to(x_rot.device)]
 
-                # ── INT4 GEMM: Triton fused unpack or PyTorch fallback ──
+                # ── INT4 GEMM: W4A8 / Triton W4A16 / PyTorch fallback ──
                 scale_col = self.weight_scale.to(device=x.device, dtype=torch.float16)
+                scale_flat = scale_col.reshape(-1)
+                x_2d = x_rot.reshape(-1, x_rot.shape[-1])
+                batch = x_2d.shape[0]
 
-                if not IntCrushInt4Ops._use_pytorch and _TRITON_INT4_UNPACK and weight.dtype == torch.uint8:
+                if (IntCrushInt4Ops._use_w4a8
+                        and self._rot_need
+                        and batch > 16
+                        and _TRITON_INT8_GEMM
+                        and _TRITON_DYNQUANT
+                        and _TRITON_INT4_INT8_UNPACK
+                        and weight.dtype == torch.uint8
+                        and x.is_cuda):
+                    # W4A8: INT8 act quant + INT4→INT8 unpack + Triton INT8 GEMM
+                    x_int8, s_a = dynamic_quantize_activation(x_2d)
+                    w_int8 = unpack_int4_to_int8(weight.to(x.device), w_in)
+                    out = fused_int8_gemm_dequant(
+                        x_int8, w_int8, scale_flat, s_a,
+                        bias=bias, out_dtype=x.dtype,
+                    )
+                    out = out.reshape(*x_rot.shape[:-1], -1)
+                    del x_int8, w_int8, s_a
+                    if need_cast and _MANUAL_CAST_AVAILABLE:
+                        uncast_bias_weight(self, weight, bias, offload_stream)
+                    return out.to(x.dtype)
+                elif not IntCrushInt4Ops._use_pytorch and _TRITON_INT4_UNPACK and weight.dtype == torch.uint8:
                     # Triton unpack to float16 + cuBLAS GEMM — fastest W4A16 path
                     weight_dev = weight.to(device=x.device).contiguous()
                     scale_dev = scale_col.view(-1).contiguous()
@@ -332,6 +381,7 @@ class SimpleINT4UNetLoader:
             },
             "optional": {
                 "use_pytorch": ("BOOLEAN", {"default": False}),
+                "use_w4a16": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -339,7 +389,7 @@ class SimpleINT4UNetLoader:
     FUNCTION = "load"
     CATEGORY = "loaders"
 
-    def load(self, unet_name: str, model_type: str, rot_size: int, use_pytorch: bool = True) -> tuple[object]:
+    def load(self, unet_name: str, model_type: str, rot_size: int, use_pytorch: bool = False, use_w4a16: bool = False) -> tuple[object]:
         import folder_paths
         import comfy.utils
         from comfy.sd import load_diffusion_model
@@ -375,8 +425,16 @@ class SimpleINT4UNetLoader:
 
         IntCrushInt4Ops._rot_size_override = rot_size
         IntCrushInt4Ops._use_pytorch = use_pytorch
-        if use_pytorch:
-            print("[INT-Crush] Using PyTorch fallback path")
+        IntCrushInt4Ops._use_w4a8 = not use_w4a16
+        if use_w4a16:
+            print("[INT-Crush] Using W4A16 path")
+            if use_pytorch:
+                print("[INT-Crush] Using PyTorch fallback for W4A16")
+        elif rot_size == 0:
+            print("[INT-Crush] WARNING: W4A8 requires rotation — falling back to W4A16")
+            IntCrushInt4Ops._use_w4a8 = False
+        else:
+            print("[INT-Crush] Using W4A8 path (default, fastest)")
         model_options = {"custom_operations": IntCrushInt4Ops}
         model = load_diffusion_model(unet_path, model_options=model_options)
 
@@ -438,7 +496,6 @@ if _COMFY_OPS_AVAILABLE:
 
         _rot_size_override = 0
         _is_gptq = False
-        _debug_shapes = False
         _perm_count = 0
 
         class Linear(manual_cast.Linear):
@@ -467,10 +524,6 @@ if _COMFY_OPS_AVAILABLE:
                 if weight_key in state_dict and scale_key in state_dict:
                     wt = state_dict[weight_key]
                     sc = state_dict[scale_key]
-
-                    if IntCrushInt8Ops._debug_shapes:
-                        print(f"[INT-Crush8] LOAD {prefix} wt={wt.dtype}{tuple(wt.shape)} "
-                              f"sc={sc.dtype}{tuple(sc.shape)}")
 
                     if wt.dtype == torch.int8 and sc.dtype == torch.float16:
                         self._is_int8 = True
@@ -504,13 +557,6 @@ if _COMFY_OPS_AVAILABLE:
                         state_dict.pop(perm_key, None)
                         state_dict.pop(bias_key, None)
                         return
-
-                if IntCrushInt8Ops._debug_shapes and weight_key in state_dict:
-                    wt = state_dict[weight_key]
-                    has_scale = scale_key in state_dict
-                    print(f"[INT-Crush8] SKIP {prefix} wt={wt.dtype}{tuple(wt.shape)} "
-                          f"has_scale={has_scale} "
-                          f"{'(scale wrong dtype)' if has_scale else '(no scale key)'}")
 
                 super()._load_from_state_dict(
                     state_dict, prefix, local_metadata,
@@ -574,10 +620,6 @@ if _COMFY_OPS_AVAILABLE:
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 # ── Fallback: non-quantized layers use the standard manual_cast path ──
                 if not self._is_int8:
-                    if IntCrushInt8Ops._debug_shapes:
-                        print(f"[INT-Crush8] NOT_INT8 {self.__class__.__qualname__} "
-                              f"x={tuple(x.shape)} w={tuple(self.weight.shape)} "
-                              f"w_dtype={self.weight.dtype}")
                     return super().forward(x)
 
                 # ── ComfyUI weight casting (low-VRAM / offload mode) ──
@@ -614,9 +656,6 @@ if _COMFY_OPS_AVAILABLE:
                 if x.shape[-1] < w_in:
                     pad = w_in - x.shape[-1]
                     x = torch.nn.functional.pad(x, (0, pad))
-                    if IntCrushInt8Ops._debug_shapes:
-                        print(f"[INT-Crush8] PADDED x {x.shape[-1] - pad} -> {x.shape[-1]} "
-                              f"to match weight in_features={w_in}")
 
                 # ── PermuQuant channel permutation ──
                 if self._perm is not None:
@@ -624,10 +663,6 @@ if _COMFY_OPS_AVAILABLE:
 
                 # ── Early exit: weight already in float (e.g. after LoRA bake-in) ──
                 if weight.dtype != torch.int8:
-                    if IntCrushInt8Ops._debug_shapes:
-                        print(f"[INT-Crush8] FALLBACK {self.__class__.__qualname__} "
-                              f"x={tuple(x.shape)} w={tuple(weight.shape)} "
-                              f"w_dtype={weight.dtype} is_int8={self._is_int8}")
                     out = F.linear(x, weight, bias)
                     if need_cast and _MANUAL_CAST_AVAILABLE:
                         uncast_bias_weight(self, weight, bias, offload_stream)
@@ -641,11 +676,6 @@ if _COMFY_OPS_AVAILABLE:
 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
-
-                if IntCrushInt8Ops._debug_shapes:
-                    print(f"[INT-Crush8] {self.__class__.__qualname__} "
-                          f"x={tuple(x.shape)} w={tuple(weight.shape)} "
-                          f"rot={self._rot_need} scale={tuple(w_scale.shape) if w_scale is not None else None}")
 
                 # Ensure weight & bias are on the compute device before branching
                 weight = weight.to(x.device, non_blocking=True)
@@ -705,16 +735,13 @@ class SimpleINT8UNetLoader:
                 "model_type": (["flux", "wan", "zimage", "chroma", "default"], {"default": "flux"}),
                 "rot_size": ([0, 16, 64, 256], {"default": 256}),
             },
-            "optional": {
-                "debug_shapes": ("BOOLEAN", {"default": False}),
-            }
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
     CATEGORY = "loaders"
 
-    def load(self, unet_name: str, model_type: str, rot_size: int, debug_shapes: bool = False) -> tuple[object]:
+    def load(self, unet_name: str, model_type: str, rot_size: int) -> tuple[object]:
         import folder_paths
         import comfy.utils
         from comfy.sd import load_diffusion_model
@@ -751,7 +778,6 @@ class SimpleINT8UNetLoader:
                 print(f"[INT-Crush] INT8: LDLQ model detected")
 
         IntCrushInt8Ops._rot_size_override = rot_size
-        IntCrushInt8Ops._debug_shapes = debug_shapes
         model_options = {"custom_operations": IntCrushInt8Ops}
         model = load_diffusion_model(unet_path, model_options=model_options)
 
@@ -798,31 +824,6 @@ class SimpleINT8UNetLoader:
 
         from .model_patcher import INT8ModelPatcher
         model = INT8ModelPatcher.clone(model)
-
-        if debug_shapes:
-            print("[INT-Crush] INT8: Shape debugging enabled — forward() will print x/weight shapes")
-            m = model.model
-            if hasattr(m, 'params'):
-                p = m.params
-                print(f"[INT-Crush] Model params: in_channels={p.in_channels} "
-                      f"patch_size={p.patch_size} hidden_size={p.hidden_size}")
-                feat_dim = p.in_channels * p.patch_size * p.patch_size
-                print(f"[INT-Crush] Expected patch feature dim: {p.in_channels} * {p.patch_size} * {p.patch_size} = {feat_dim}")
-                if hasattr(m, 'img_in'):
-                    w = m.img_in.weight if hasattr(m.img_in, 'weight') else None
-                    if w is not None:
-                        print(f"[INT-Crush] img_in weight: {tuple(w.shape)} (in_features={w.shape[1]})")
-                        if w.shape[1] != feat_dim:
-                            print(f"[INT-Crush] WARNING: img_in.in_features ({w.shape[1]}) != patch feature dim ({feat_dim})")
-            # Count int8 layers
-            int8_count = 0
-            total_count = 0
-            for name, module in m.named_modules():
-                if hasattr(module, '_is_int8'):
-                    total_count += 1
-                    if module._is_int8:
-                        int8_count += 1
-            print(f"[INT-Crush] INT8 layers: {int8_count}/{total_count}")
 
         return (model,)
 
