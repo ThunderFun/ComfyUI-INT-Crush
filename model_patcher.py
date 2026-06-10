@@ -76,10 +76,17 @@ class INT4LowVramPatch:
         if isinstance(scale, torch.Tensor):
             scale = scale.to(weight.device)
 
+        zp = getattr(self.module, 'weight_zp', None)
+        if isinstance(zp, torch.Tensor):
+            zp = zp.to(weight.device)
+
         # Dequantize INT4 -> float (per-row)
         # Weight is in rotated+permuted space; dequant gives the same.
         unpacked = unpack_int4(weight, self.module.in_features)
-        weight_float = (unpacked.float() * scale.float()).reshape(self.module.out_features, self.module.in_features)
+        if zp is not None:
+            weight_float = (unpacked.float() - zp.reshape(-1, 1).float()) * scale.float()
+        else:
+            weight_float = (unpacked.float() * scale.float()).reshape(self.module.out_features, self.module.in_features)
 
         # Apply LoRA patches in float space
         patches_list = self.patches.get(self.key, [])
@@ -148,8 +155,15 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
             if isinstance(scale, torch.Tensor):
                 scale = scale.to(device_to)
 
+            zp = getattr(module, 'weight_zp', None)
+            if isinstance(zp, torch.Tensor):
+                zp = zp.to(device_to)
+
             unpacked = unpack_int4(source_weight.to(device_to), module.in_features)
-            weight_float = (unpacked.float() * scale.float()).reshape(module.out_features, module.in_features)
+            if zp is not None:
+                weight_float = (unpacked.float() - zp.reshape(-1, 1).float()) * scale.float()
+            else:
+                weight_float = (unpacked.float() * scale.float()).reshape(module.out_features, module.in_features)
 
             # Apply LoRA patches in float space
             patches_list = self.patches.get(key, [])

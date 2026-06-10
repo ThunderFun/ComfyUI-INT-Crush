@@ -119,6 +119,7 @@ if _COMFY_OPS_AVAILABLE:
                 self._rot_size = IntCrushInt4Ops._rot_size_override
                 self._perm = None  # PermuQuant permutation indices
                 self.register_buffer("weight_scale", None)
+                self.register_buffer("weight_zp", None)
                 self.weight_comfy_model_dtype = getattr(self.weight, "dtype", None)
                 self.bias_comfy_model_dtype = getattr(self.bias, "dtype", None)
 
@@ -135,6 +136,7 @@ if _COMFY_OPS_AVAILABLE:
                 """
                 weight_key = prefix + "weight"
                 scale_key = prefix + "weight_scale"
+                zp_key = prefix + "weight_zp"
                 perm_key = prefix + "weight.perm"
 
                 if weight_key in state_dict and scale_key in state_dict:
@@ -145,6 +147,10 @@ if _COMFY_OPS_AVAILABLE:
                         self._is_int4 = True
                         self.weight = nn.Parameter(wt, requires_grad=False)
                         self.register_buffer("weight_scale", sc)
+
+                        # Load zero-point if present (asymmetric quantization)
+                        if zp_key in state_dict:
+                            self.register_buffer("weight_zp", state_dict[zp_key])
 
                         # Load PermuQuant permutation if present
                         if perm_key in state_dict:
@@ -170,6 +176,7 @@ if _COMFY_OPS_AVAILABLE:
 
                         state_dict.pop(weight_key, None)
                         state_dict.pop(scale_key, None)
+                        state_dict.pop(zp_key, None)
                         state_dict.pop(perm_key, None)
                         state_dict.pop(bias_key, None)
                         return
@@ -297,6 +304,10 @@ if _COMFY_OPS_AVAILABLE:
                 x_2d = x_rot.reshape(-1, x_rot.shape[-1])
                 batch = x_2d.shape[0]
 
+                # Precompute zero-point correction: out -= (scale * zp) * x.sum(dim=-1)
+                has_zp = self.weight_zp is not None
+                zp_col = self.weight_zp.to(device=x.device, dtype=torch.float16) if has_zp else None
+
                 if (IntCrushInt4Ops._use_w4a8
                         and self._rot_need
                         and batch > 16
@@ -314,6 +325,9 @@ if _COMFY_OPS_AVAILABLE:
                     )
                     out = out.reshape(*x_rot.shape[:-1], -1)
                     del x_int8, w_int8, s_a
+                    if has_zp:
+                        correction = (scale_col.squeeze().float() * zp_col.squeeze().float()).to(out.dtype)
+                        out = out - x_rot.sum(dim=-1, keepdim=True) * correction
                     if need_cast and _MANUAL_CAST_AVAILABLE:
                         uncast_bias_weight(self, weight, bias, offload_stream)
                     return out.to(x.dtype)
@@ -323,11 +337,18 @@ if _COMFY_OPS_AVAILABLE:
                     scale_dev = scale_col.view(-1).contiguous()
                     weight_f16 = unpack_int4_to_float16(weight_dev, scale_dev, w_in)
                     out = F.linear(x_rot, weight_f16.to(x_rot.dtype))
+                    if has_zp:
+                        correction = (scale_col.squeeze().float() * zp_col.squeeze().float()).to(out.dtype)
+                        out = out - x_rot.sum(dim=-1, keepdim=True) * correction
                 else:
                     # Pure PyTorch fallback: dequantize weights then F.linear
                     from ._quant_utils import unpack_int4
                     unpacked = unpack_int4(weight, w_in).to(device=x.device)
-                    weight_f = (unpacked.float() * scale_col.float()).to(x_rot.dtype)
+                    if has_zp:
+                        weight_f = (unpacked.float() - zp_col.reshape(-1, 1).float()) * scale_col.float()
+                    else:
+                        weight_f = (unpacked.float() * scale_col.float())
+                    weight_f = weight_f.to(x_rot.dtype)
                     out = F.linear(x_rot, weight_f)
 
                 if bias is not None:
