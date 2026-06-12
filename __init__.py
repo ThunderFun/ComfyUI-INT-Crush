@@ -3,21 +3,20 @@
 import logging
 import torch
 
-from .convlinear import ConvLinear4bit
-
-__all__ = ["ConvLinear4bit"]
+try:
+    from .convlinear import ConvLinear4bit
+    __all__ = ["ConvLinear4bit"]
+except ImportError:
+    ConvLinear4bit = None
+    __all__ = []
 
 
 def _register_layouts():
-    """Register INT4/INT8 quantization layouts with ComfyUI's model management.
+    """Register INT4/INT8 layout classes and QUANT_ALGOS entries with ComfyUI.
 
-    Called automatically at import time. Registers two QuantizedLayout subclasses
-    (Int4TensorwiseLayout, Int8TensorwiseLayout) and their corresponding entries
-    in the QUANT_ALGOS registry so ComfyUI can recognise and dequantize
-    INT-Crush weight tensors stored in safetensors checkpoints.
-
-    Silently warns if ComfyUI's quantization system is not available (e.g.
-    running outside ComfyUI or on an older ComfyUI version).
+    Called at import time so ComfyUI can recognise and dequantize INT-Crush
+    weight tensors from safetensors checkpoints.  Warns silently if the
+    ComfyUI quantization system is unavailable.
     """
     try:
         from comfy.quant_ops import QUANT_ALGOS, register_layout_class, QuantizedLayout

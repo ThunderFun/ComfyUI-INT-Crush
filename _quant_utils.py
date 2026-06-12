@@ -1,13 +1,7 @@
 """Quantization utilities for INT-Crush INT4/INT8 inference.
 
-Provides the low-level operations used by ConvLinear4bit/ConvLinear8bit and
-the ComfyUI custom ops:
-
-- Hadamard rotation (Regular Hadamard for powers of 4, Sylvester fallback)
-- INT4 pack/unpack (two's complement, two values per uint8 byte)
-- INT8 pack/unpack (passthrough — stored as plain int8)
-- Per-group scale calculation and weight quantization (INT4 and INT8)
-- Activation scale calculation for dynamic per-token quantization
+Hadamard rotation, INT4/INT8 pack/unpack, per-group scale calculation,
+weight quantization, and activation scale calculation.
 """
 
 import math
@@ -35,14 +29,12 @@ _H_cache: dict[tuple, torch.Tensor] = {}
 
 
 def make_hadamard_regular(n: int, dtype: torch.dtype = torch.float16, device: str = "cpu") -> torch.Tensor:
-    """Construct a normalized Regular Hadamard matrix of size n.
+    """Normalized Regular Hadamard matrix of size n (power of 4).
 
-    Regular Hadamard matrices have balanced row sums (all = ±1 when normalized),
-    preventing row-wise outlier aggregation during rotation (ConvRot, arXiv:2512.03673).
-    Must be a power of 4 (4, 16, 64, 256, ...).
+    Balanced row sums prevent outlier aggregation during rotation (ConvRot, arXiv:2512.03673).
     """
     if not _is_power_of_four(n):
-        raise ValueError(f"Regular Hadamard requires power of 4, got {n}. Use rot_size=16/64/256.")
+        raise ValueError(f"Regular Hadamard requires power of 4, got {n}. Use rot_size=16/64/256/1024/4096.")
 
     key = (n, str(dtype), device)
     if key in _H_cache:
@@ -77,10 +69,9 @@ def _make_hadamard_sylvester(n: int, dtype: torch.dtype = torch.float16, device:
 
 
 def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = None) -> torch.Tensor:
-    """Apply group-wise Hadamard rotation to activations.
+    """Group-wise Hadamard rotation on activations.
 
-    Uses Regular Hadamard for powers of 4 (ConvRot paper). Falls back to
-    Sylvester construction for non-power-of-4 sizes.
+    Uses Regular Hadamard for powers of 4, Sylvester fallback otherwise.
     """
     if not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
@@ -168,7 +159,7 @@ def unpack_int8(packed: torch.Tensor, K: int) -> torch.Tensor:
 
 
 def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Calculate per-group scales for INT4 quantization.
+    """Per-group scales for INT4 quantization (per-row when group_size == in_features).
 
     Args:
         W: [out_features, in_features] weight tensor
@@ -194,7 +185,7 @@ def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> t
 
 
 def calculate_scales_int8(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Calculate per-group scales for INT8 quantization.
+    """Per-group scales for INT8 quantization (per-row when group_size == in_features).
 
     Args:
         W: [out_features, in_features] weight tensor
@@ -220,7 +211,7 @@ def calculate_scales_int8(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE)
 
 
 def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weight matrix to INT4 using precomputed per-group scales.
+    """Quantize weights to INT4 using precomputed per-group scales (per-row when group_size == in_features).
 
     Args:
         W: [out_features, in_features] rotated weight tensor
@@ -244,7 +235,7 @@ def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = DE
 
 
 def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weight matrix to INT8 using precomputed per-group scales.
+    """Quantize weights to INT8 using precomputed per-group scales (per-row when group_size == in_features).
 
     Args:
         W: [out_features, in_features] rotated weight tensor
@@ -268,7 +259,7 @@ def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor, group_size: int
 
 
 def calculate_activation_scales(x: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Calculate per-group scales for activation quantization.
+    """Per-group scales for activation quantization (per-token when group_size == K).
 
     Args:
         x: [..., K] activation tensor (float16), arbitrary leading dims

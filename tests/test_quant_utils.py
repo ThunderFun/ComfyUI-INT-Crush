@@ -18,11 +18,11 @@ INT4_MAX = _qu.INT4_MAX
 
 class TestIsPowerOfFour:
     def test_powers(self):
-        for n in [4, 16, 64, 256]:
+        for n in [4, 16, 64, 256, 1024, 4096]:
             assert _is_power_of_four(n)
 
     def test_not_powers(self):
-        for n in [1, 2, 8, 32, 128]:
+        for n in [1, 2, 8, 32, 128, 512, 2048]:
             assert not _is_power_of_four(n)
 
     def test_zero(self):
@@ -34,7 +34,7 @@ class TestIsPowerOfFour:
 
 class TestMakeHadamardRegular:
     def test_shape(self):
-        for n in [4, 16, 64]:
+        for n in [4, 16, 64, 256, 1024]:
             H = make_hadamard_regular(n)
             assert H.shape == (n, n)
 

@@ -1,12 +1,11 @@
-"""ConvLinear4bit/ConvLinear8bit — W4A16/W8A16 inference modules using INT-Crush.
+"""ConvLinear4bit/ConvLinear8bit — W4A16/W8A16 inference modules.
 
-Drop-in replacements for nn.Linear that integrate:
-  1. Rotation: group-wise Regular Hadamard Transform on input activations
-  2. Quantization: symmetric per-row INT4/INT8 quantization
-  3. Dequantization: per-row scale restoration + F.linear
+Drop-in nn.Linear replacements with:
+  1. Group-wise Hadamard rotation on activations
+  2. Symmetric per-row INT4/INT8 quantization
+  3. On-the-fly dequantization in forward()
 
-Weights are stored as packed INT4 (uint8) or plain INT8 (int8) with per-row
-FP16 scales.  Dequantization happens on-the-fly during forward().
+Weights: packed INT4 (uint8) or plain INT8 (int8) with per-row FP16 scales.
 """
 
 import torch
@@ -51,7 +50,7 @@ class ConvLinear8bit(nn.Module):
         else:
             x_rot = x
 
-        weight_f16 = (self.weight.float() * self.scale.float()).to(x_rot.dtype)
+        weight_f16 = self.weight.to(x_rot.dtype) * self.scale.to(x_rot.dtype)
         bias = self.bias.to(x_rot.dtype) if self.bias is not None else None
         return F.linear(x_rot, weight_f16, bias)
 
@@ -143,7 +142,7 @@ class ConvLinear4bit(nn.Module):
             x_rot = x_rot[..., self._perm.to(x_rot.device)]
 
         unpacked = _qu.unpack_int4(self.weight, self.in_features)  # [out, in] int8
-        weight_f16 = (unpacked.float() * self.scale.float()).to(x_rot.dtype)
+        weight_f16 = unpacked.to(x_rot.dtype) * self.scale.to(x_rot.dtype)
         bias = self.bias.to(x_rot.dtype) if self.bias is not None else None
         return F.linear(x_rot, weight_f16, bias)
 

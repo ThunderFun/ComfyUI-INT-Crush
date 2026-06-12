@@ -105,8 +105,8 @@ class TestIntMmDequant:
     @pytest.mark.skipif(not _HAS_CUDA, reason="CUDA required")
     @pytest.mark.skipif(not _HAS_INT_MM, reason="torch._int_mm required")
     def test_int_mm_basic(self):
-        a = torch.randint(-128, 127, (4, 8), dtype=torch.int8, device="cuda")
-        b = torch.randint(-128, 127, (6, 8), dtype=torch.int8, device="cuda")
+        a = torch.randint(-128, 127, (32, 64), dtype=torch.int8, device="cuda")
+        b = torch.randint(-128, 127, (16, 64), dtype=torch.int8, device="cuda")
         result = torch._int_mm(a, b.t().contiguous())
         ref = a.float() @ b.t().float()
         assert torch.allclose(result.float(), ref, atol=1)
@@ -114,8 +114,8 @@ class TestIntMmDequant:
     @pytest.mark.skipif(not _HAS_CUDA, reason="CUDA required")
     @pytest.mark.skipif(not _HAS_INT_MM, reason="torch._int_mm required")
     def test_int_mm_pretransposed(self):
-        a = torch.randint(-128, 127, (4, 8), dtype=torch.int8, device="cuda")
-        b = torch.randint(-128, 127, (6, 8), dtype=torch.int8, device="cuda")
+        a = torch.randint(-128, 127, (32, 64), dtype=torch.int8, device="cuda")
+        b = torch.randint(-128, 127, (16, 64), dtype=torch.int8, device="cuda")
         b_t = b.t().contiguous()
         result = torch._int_mm(a, b_t)
         ref = a.float() @ b.t().float()
@@ -166,13 +166,13 @@ class TestW4A8Path:
     @pytest.mark.skipif(not _HAS_INT_MM, reason="torch._int_mm required")
     @pytest.mark.skipif(not _HAS_DYNQUANT, reason="Triton dynamic_quantize not available")
     def test_w4a8_vs_w4a16_reference(self):
-        N, K, M = 32, 128, 20
+        N, K, M = 32, 128, 32
         packed, scale_flat, K_orig = _make_int4_layer(N, K, device="cuda")
         x = torch.randn(M, K, dtype=torch.float16, device="cuda")
         x_rot = rotate_activations(x, 64)
 
         unpacked = unpack_int4(packed.cuda(), K_orig)
-        weight_f16 = (unpacked.float() * scale_flat.cuda().float()).to(torch.float16)
+        weight_f16 = (unpacked.float() * scale_flat.cuda().float().unsqueeze(1)).to(torch.float16)
         out_ref = torch.nn.functional.linear(x_rot, weight_f16)
 
         x_2d = x_rot.reshape(-1, K)
@@ -196,7 +196,7 @@ class TestW4A8Path:
     @pytest.mark.skipif(not _HAS_INT_MM, reason="torch._int_mm required")
     @pytest.mark.skipif(not _HAS_DYNQUANT, reason="Triton dynamic_quantize not available")
     def test_w4a8_shape(self):
-        N, K, M = 16, 64, 20
+        N, K, M = 32, 64, 32
         packed, scale_flat, K_orig = _make_int4_layer(N, K, device="cuda")
         x = torch.randn(M, K, dtype=torch.float16, device="cuda")
         x_rot = rotate_activations(x, 64)

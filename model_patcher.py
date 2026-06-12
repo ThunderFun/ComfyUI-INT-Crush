@@ -231,17 +231,10 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().unpatch_model(device_to, unpatch_weights)
 
     def clone(self, *args, **kwargs):
-        """Clone this patcher, preserving INT4-aware patching in the copy.
+        """Clone preserving INT4-aware patching.
 
-        ComfyUI's ModelPatcher subclasses (e.g. ModelPatcherDynamic for
-        --fast mode) each have their own clone() that returns an instance
-        of *their own class*.  That clone would lose the INT4 bake-in
-        logic unless we inject INT4ModelPatcher into the MRO.
-
-        Strategy: temporarily swap self.__class__ to a dynamic subclass
-        that inherits from both INT4ModelPatcher and the original class,
-        call super().clone() (which copies the class pointer), then
-        restore self.__class__ so we don't pollute the original object.
+        Temporarily injects INT4ModelPatcher into the MRO so that
+        ComfyUI's subclass-specific clone() returns an INT4-aware copy.
         """
         src_cls = self.__class__
 
@@ -455,11 +448,7 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().unpatch_model(device_to, unpatch_weights)
 
     def clone(self, *args, **kwargs):
-        """Clone this patcher, preserving INT8-aware patching in the copy.
-
-        Same class-surgery strategy as INT4ModelPatcher.clone() — see its
-        docstring for the rationale.
-        """
+        """Clone preserving INT8-aware patching. Same strategy as INT4ModelPatcher.clone()."""
         src_cls = self.__class__
 
         if src_cls is INT8ModelPatcher:

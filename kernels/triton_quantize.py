@@ -79,24 +79,24 @@ def _fused_quantize_kernel(
         tl.store(out_base + cols, clamped.to(tl.int8), mask=mask)
 
 
-def dynamic_quantize_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def dynamic_quantize_activation(
+    x: torch.Tensor,
+    s_a_out: torch.Tensor | None = None,
+    x_int8_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize an activation tensor to symmetric INT8 with *per-token* dynamic scales.
+    Quantize activations to symmetric INT8 with per-token dynamic scales.
 
     Parameters
     ----------
-    x : torch.Tensor
-        Activation tensor of shape ``[M, K]`` (or any shape where the last dim
-        is the feature dimension).  dtype is typically bf16 or fp16.
+    x : [M, K] activation tensor (bf16/fp16)
+    s_a_out : optional pre-allocated [M] float32 buffer for scales
+    x_int8_out : optional pre-allocated [M, K] int8 buffer for output
 
     Returns
     -------
-    x_int8 : torch.Tensor
-        Quantized tensor of the same shape as ``x``, dtype ``torch.int8``.
-    s_a : torch.Tensor
-        Per-token (per-row) activation scales, shape ``[M]``.
-        ``s_a[i] = max(abs(x[i, :])) / 127`` (the 1/127 factor is absorbed
-        so the GEMM kernel only needs to multiply).
+    x_int8 : [M, K] int8 quantized tensor
+    s_a : [M] per-token scales (max-abs / 127, absorbed for GEMM)
     """
     orig_shape = x.shape
     if x.dim() > 2:
@@ -114,7 +114,7 @@ def dynamic_quantize_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
             s_a = s_a.reshape(*orig_shape[:-1])
         return x_int8, s_a
 
-    x_contig = x.contiguous()
+    x_contig = x if x.is_contiguous() else x.contiguous()
 
     # Pick the largest power-of-2 <= 2048 that divides K evenly.
     BLOCK_K = 1
@@ -122,8 +122,14 @@ def dynamic_quantize_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     while BLOCK_K < min(K, max_block) and K % (BLOCK_K * 2) == 0:
         BLOCK_K *= 2
 
-    s_a = torch.empty(M, dtype=torch.float32, device=x.device)
-    x_int8 = torch.empty(M, K, dtype=torch.int8, device=x.device)
+    if s_a_out is not None and s_a_out.shape == (M,) and s_a_out.dtype == torch.float32:
+        s_a = s_a_out
+    else:
+        s_a = torch.empty(M, dtype=torch.float32, device=x.device)
+    if x_int8_out is not None and x_int8_out.shape == (M, K) and x_int8_out.dtype == torch.int8:
+        x_int8 = x_int8_out
+    else:
+        x_int8 = torch.empty(M, K, dtype=torch.int8, device=x.device)
 
     _fused_quantize_kernel[(M,)](
         x_contig,

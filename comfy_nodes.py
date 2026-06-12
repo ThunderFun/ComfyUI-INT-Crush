@@ -5,6 +5,7 @@ Provides:
   - SimpleINT8UNetLoader: loads a quantized model with INT8 weights in memory
 """
 
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,16 +48,50 @@ try:
 except Exception:
     pass
 
+_HAS_FUSED_QUANT_GEMM = False
+try:
+    from .kernels.triton_int8_gemm import fused_quant_int8_gemm_dequant
+    _HAS_FUSED_QUANT_GEMM = True
+except Exception:
+    pass
+
 try:
     from .kernels.triton_int4_to_int8_unpack import unpack_int4_to_int8
     _TRITON_INT4_INT8_UNPACK = True
 except Exception:
     pass
 
+_TRITON_FHT = False
+try:
+    from .kernels.triton_fht import fht_quantize_activation
+    _TRITON_FHT = True
+except Exception:
+    pass
+
 if _TRITON_INT8_GEMM and _TRITON_DYNQUANT:
+    _TRITON_AVAILABLE = True
     print("[INT-Crush] Triton INT8 GEMM + dynamic quantizer loaded")
 if _TRITON_INT4_INT8_UNPACK:
     print("[INT-Crush] Triton INT4->INT8 unpack kernel loaded")
+
+try:
+    import triton.backends.nvidia.driver as _triton_nvidia
+
+    _orig_get_cache = _triton_nvidia.CUDADriver.get_empty_cache_for_benchmark
+
+    def _get_cache_small(self):
+        try:
+            free_mem, _ = torch.cuda.mem_get_info()
+            budget = min(32 * 1024 * 1024, free_mem // 8)
+        except Exception:
+            budget = 32 * 1024 * 1024
+        if budget < 4 * 1024 * 1024:
+            return torch.empty(0, dtype=torch.int, device="cuda")
+        return torch.empty(budget // 4, dtype=torch.int, device="cuda")
+
+    _triton_nvidia.CUDADriver.get_empty_cache_for_benchmark = _get_cache_small
+except Exception:
+    pass
 
 try:
     from comfy.ops import manual_cast
@@ -65,24 +100,26 @@ except ImportError:
     _COMFY_OPS_AVAILABLE = False
 
 try:
-    from comfy.ops.manual_cast import cast_bias_weight, uncast_bias_weight
+    from comfy.ops import cast_bias_weight, uncast_bias_weight
     _MANUAL_CAST_AVAILABLE = True
 except ImportError:
-    _MANUAL_CAST_AVAILABLE = False
+    try:
+        from comfy.ops.manual_cast import cast_bias_weight, uncast_bias_weight
+        _MANUAL_CAST_AVAILABLE = True
+    except ImportError:
+        _MANUAL_CAST_AVAILABLE = False
 
 
 def _requantize_int4(w_float, rot_need, rot_size):
-    """Re-quantize a float weight tensor to packed INT4 with per-row scales.
+    """Re-quantize a float weight to packed INT4 with per-row scales.
 
-    Used by set_weight() when a LoRA patch or other operation produces a
-    float32 weight that needs to be stored back in INT4 format.  Applies
-    rotation (if the layer requires it), computes per-row scales, rounds,
-    and packs two INT4 values per uint8 byte.
+    Used by set_weight() when LoRA or other op produces a float weight.
+    Optionally applies rotation, then rounds + packs two INT4 per uint8.
 
     Args:
-        w_float: [out_features, in_features] float weight tensor
-        rot_need: whether to apply Hadamard rotation before quantizing
-        rot_size: Hadamard group size (16, 64, or 256)
+        w_float: [out_features, in_features] float weight
+        rot_need: whether to apply Hadamard rotation
+        rot_size: Hadamard group size (16, 64, 256, 1024, or 4096)
 
     Returns:
         packed: [out_features, in_features // 2] uint8 packed INT4 weights
@@ -98,6 +135,67 @@ def _requantize_int4(w_float, rot_need, rot_size):
     int_rounded = w_scaled.round().clamp(-8, 7).to(torch.int8)
     packed = pack_int4(int_rounded).to(torch.uint8)
     return packed, scales
+
+
+# ── Profiling helper ─────────────────────────────────────────────────────────
+
+class _LayerProfiler:
+    """Accumulates per-section timings across forward calls and prints a
+    summary every ``every`` calls.  Uses CUDA events for accurate GPU
+    timing without forcing full-device synchronisation."""
+
+    enabled = False  # Set True only for profiling; kills async overlap
+
+    def __init__(self, name, every=50):
+        self.name = name
+        self.every = every
+        self.sections: dict[str, list[float]] = {}
+        self.call_count = 0
+        self._starts: dict[str, torch.cuda.Event] = {}
+        self._ends: dict[str, torch.cuda.Event] = {}
+
+    def start(self, section: str):
+        if not self.enabled:
+            return
+        evt = torch.cuda.Event(enable_timing=True)
+        evt.record()
+        self._starts[section] = evt
+
+    def end(self, section: str):
+        if not self.enabled:
+            return
+        evt = torch.cuda.Event(enable_timing=True)
+        evt.record()
+        self._ends[section] = evt
+
+    def finish_call(self):
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        for section, end_evt in self._ends.items():
+            start_evt = self._starts[section]
+            dt = start_evt.elapsed_time(end_evt) / 1000.0  # ms → s
+            self.sections.setdefault(section, []).append(dt)
+        self._starts.clear()
+        self._ends.clear()
+        self.call_count += 1
+        if self.call_count % self.every == 0:
+            self._print_summary()
+
+    def _print_summary(self):
+        lines = [f"\n{'='*60}", f"  {self.name} — after {self.call_count} calls", f"{'='*60}"]
+        total_avg = 0.0
+        for sec, times in self.sections.items():
+            avg = sum(times[-self.every:]) / len(times[-self.every:])
+            total_avg += avg
+            lines.append(f"  {sec:>30s}: {avg*1000:>8.3f} ms")
+        lines.append(f"  {'TOTAL':>30s}: {total_avg*1000:>8.3f} ms")
+        lines.append(f"{'='*60}")
+        print("\n".join(lines))
+
+
+_int4_profiler = _LayerProfiler("IntCrushInt4Ops.Linear", every=50)
+_int8_profiler = _LayerProfiler("IntCrushInt8Ops.Linear", every=50)
 
 
 if _COMFY_OPS_AVAILABLE:
@@ -125,14 +223,10 @@ if _COMFY_OPS_AVAILABLE:
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                                       strict, missing_keys, unexpected_keys, error_msgs):
-                """Intercept weight loading to detect INT-Crush INT4 tensors.
+                """Intercept loading to detect INT-Crush INT4 tensors (uint8 weight + fp16 scale).
 
-                When the state dict contains a uint8 weight + float16 weight_scale
-                pair, this layer enters INT4 mode: the raw packed weights and scales
-                are stored directly (bypassing normal nn.Linear loading), and the
-                rotation flag is set based on the layer name.
-
-                Also loads an optional PermuQuant permutation tensor (weight.perm).
+                Enters INT4 mode when detected: stores raw packed weights/scales directly,
+                sets rotation flag from layer name, and loads optional PermuQuant permutation.
                 """
                 weight_key = prefix + "weight"
                 scale_key = prefix + "weight_scale"
@@ -179,6 +273,7 @@ if _COMFY_OPS_AVAILABLE:
                         state_dict.pop(zp_key, None)
                         state_dict.pop(perm_key, None)
                         state_dict.pop(bias_key, None)
+
                         return
 
                 super()._load_from_state_dict(
@@ -241,13 +336,13 @@ if _COMFY_OPS_AVAILABLE:
 
             @torch.no_grad()
             def forward(self, x: torch.Tensor) -> torch.Tensor:
-                # ── Fallback: non-quantized layers use the standard manual_cast path ──
+                p = _int4_profiler
+                # ── Fallback: non-quantized layers ──
                 if not self._is_int4:
                     return super().forward(x)
 
                 # ── ComfyUI weight casting (low-VRAM / offload mode) ──
-                # When ComfyUI manages weight offloading, cast_bias_weight() handles
-                # moving the packed uint8 weight to the compute device.
+                p.start("cast")
                 need_cast = (
                     _MANUAL_CAST_AVAILABLE
                     and (
@@ -268,21 +363,36 @@ if _COMFY_OPS_AVAILABLE:
                     weight = self.weight
                     bias = self.bias
                     offload_stream = None
+                p.end("cast")
 
                 # ── Hadamard rotation ──
-                # Applied before the dtype check so the early-return fallback
-                # (when weight was already dequantized by a LoRA patch) also
-                # uses rotated activations.
-                if self._rot_need:
+                # Only skip Python rotation when the FHT Triton kernel will
+                # actually be taken (requires batch > 16, all Triton kernels
+                # available, weight still packed uint8, etc.).
+                _pre_batch = x.reshape(-1, x.shape[-1]).shape[0]
+                use_fht = (
+                    self._rot_need and _TRITON_FHT
+                    and self._rot_size >= 256 and x.is_cuda
+                    and IntCrushInt4Ops._use_w4a8
+                    and _pre_batch > 16
+                    and _TRITON_INT8_GEMM
+                    and _TRITON_DYNQUANT
+                    and _TRITON_INT4_INT8_UNPACK
+                    and weight.dtype == torch.uint8
+                )
+                p.start("rotation")
+                if self._rot_need and not use_fht:
                     x_rot = self._rotate(x)
                 else:
                     x_rot = x
+                p.end("rotation")
 
                 # ── Early exit: weight already in float (e.g. after LoRA bake-in) ──
                 if weight.dtype != torch.uint8:
                     out = F.linear(x_rot, weight, bias)
                     if need_cast and _MANUAL_CAST_AVAILABLE:
                         uncast_bias_weight(self, weight, bias, offload_stream)
+                    p.finish_call()
                     return out.to(x.dtype)
 
                 # ── Activation padding ──
@@ -299,14 +409,20 @@ if _COMFY_OPS_AVAILABLE:
                     x_rot = x_rot[..., self._perm.to(x_rot.device)]
 
                 # ── INT4 GEMM: W4A8 / Triton W4A16 / PyTorch fallback ──
-                scale_col = self.weight_scale.to(device=x.device, dtype=torch.float16)
-                scale_flat = scale_col.reshape(-1)
+                p.start("scale_xfer")
+                scale_col = self.weight_scale
+                if scale_col.device != x.device:
+                    scale_col = scale_col.to(x.device)
+                # Convert to fp32 for GEMM kernel precision (INT8 path does this at load time)
+                scale_flat = scale_col.reshape(-1).float().contiguous()
                 x_2d = x_rot.reshape(-1, x_rot.shape[-1])
                 batch = x_2d.shape[0]
 
-                # Precompute zero-point correction: out -= (scale * zp) * x.sum(dim=-1)
+                # Zero-point correction (recomputed each call — tiny tensor)
                 has_zp = self.weight_zp is not None
-                zp_col = self.weight_zp.to(device=x.device, dtype=torch.float16) if has_zp else None
+                if has_zp:
+                    zp_cor = (scale_col.reshape(-1).float() * self.weight_zp.to(x.device).reshape(-1).float()).to(torch.float16)
+                p.end("scale_xfer")
 
                 if (IntCrushInt4Ops._use_w4a8
                         and self._rot_need
@@ -317,46 +433,78 @@ if _COMFY_OPS_AVAILABLE:
                         and weight.dtype == torch.uint8
                         and x.is_cuda):
                     # W4A8: INT8 act quant + INT4→INT8 unpack + Triton INT8 GEMM
-                    x_int8, s_a = dynamic_quantize_activation(x_2d)
-                    w_int8 = unpack_int4_to_int8(weight.to(x.device), w_in)
+                    p.start("quantize")
+                    if use_fht:
+                        x_int8, s_a = fht_quantize_activation(x_2d, self._rot_size)
+                    else:
+                        x_int8, s_a = dynamic_quantize_activation(x_2d)
+                    p.end("quantize")
+                    p.start("unpack")
+                    weight_dev = weight
+                    if not weight_dev.is_contiguous():
+                        weight_dev = weight_dev.contiguous()
+                    w_int8 = unpack_int4_to_int8(weight_dev, w_in)
+                    p.end("unpack")
+                    p.start("gemm")
                     out = fused_int8_gemm_dequant(
                         x_int8, w_int8, scale_flat, s_a,
                         bias=bias, out_dtype=x.dtype,
                     )
                     out = out.reshape(*x_rot.shape[:-1], -1)
                     del x_int8, w_int8, s_a
+                    p.end("gemm")
                     if has_zp:
-                        correction = (scale_col.squeeze().float() * zp_col.squeeze().float()).to(out.dtype)
-                        out = out - x_rot.sum(dim=-1, keepdim=True) * correction
+                        p.start("zp_cor")
+                        x_sum = x_rot.sum(dim=-1, keepdim=True)
+                        out = out - x_sum * zp_cor
+                        p.end("zp_cor")
+                    p.start("uncast")
                     if need_cast and _MANUAL_CAST_AVAILABLE:
                         uncast_bias_weight(self, weight, bias, offload_stream)
+                    p.end("uncast")
+                    p.finish_call()
                     return out.to(x.dtype)
                 elif not IntCrushInt4Ops._use_pytorch and _TRITON_INT4_UNPACK and weight.dtype == torch.uint8:
                     # Triton unpack to float16 + cuBLAS GEMM — fastest W4A16 path
-                    weight_dev = weight.to(device=x.device).contiguous()
-                    scale_dev = scale_col.view(-1).contiguous()
-                    weight_f16 = unpack_int4_to_float16(weight_dev, scale_dev, w_in)
+                    p.start("unpack")
+                    weight_dev = weight
+                    if not weight_dev.is_contiguous():
+                        weight_dev = weight_dev.contiguous()
+                    weight_f16 = unpack_int4_to_float16(weight_dev, scale_flat.contiguous(), w_in)
+                    p.end("unpack")
+                    p.start("gemm")
                     out = F.linear(x_rot, weight_f16.to(x_rot.dtype))
+                    del weight_f16
+                    p.end("gemm")
                     if has_zp:
-                        correction = (scale_col.squeeze().float() * zp_col.squeeze().float()).to(out.dtype)
-                        out = out - x_rot.sum(dim=-1, keepdim=True) * correction
+                        p.start("zp_cor")
+                        x_sum = x_rot.sum(dim=-1, keepdim=True)
+                        out = out - x_sum * zp_cor
+                        p.end("zp_cor")
                 else:
                     # Pure PyTorch fallback: dequantize weights then F.linear
+                    p.start("dequant_pytorch")
                     from ._quant_utils import unpack_int4
                     unpacked = unpack_int4(weight, w_in).to(device=x.device)
                     if has_zp:
-                        weight_f = (unpacked.float() - zp_col.reshape(-1, 1).float()) * scale_col.float()
+                        zp_col = self.weight_zp.to(device=x.device, dtype=torch.float16)
+                        weight_f = (unpacked.to(x_rot.dtype) - zp_col.reshape(-1, 1)) * scale_col
                     else:
-                        weight_f = (unpacked.float() * scale_col.float())
-                    weight_f = weight_f.to(x_rot.dtype)
+                        weight_f = unpacked.to(x_rot.dtype) * scale_col
+                    p.end("dequant_pytorch")
+                    p.start("gemm")
                     out = F.linear(x_rot, weight_f)
+                    p.end("gemm")
 
                 if bias is not None:
                     out = out + bias.to(device=x.device, dtype=out.dtype)
 
+                p.start("uncast")
                 if need_cast and _MANUAL_CAST_AVAILABLE:
                     uncast_bias_weight(self, weight, bias, offload_stream)
+                p.end("uncast")
 
+                p.finish_call()
                 return out.to(x.dtype)
 
             def _rotate(self, x: torch.Tensor) -> torch.Tensor:
@@ -398,7 +546,7 @@ class SimpleINT4UNetLoader:
             "required": {
                 "unet_name": (_get_diffusion_model_list(),),
                 "model_type": (["flux", "wan", "zimage", "chroma", "default"], {"default": "flux"}),
-                "rot_size": ([0, 16, 64, 256], {"default": 256}),
+                "rot_size": ([0, 16, 64, 256, 1024, 4096], {"default": 256}),
             },
             "optional": {
                 "use_pytorch": ("BOOLEAN", {"default": False}),
@@ -433,7 +581,7 @@ class SimpleINT4UNetLoader:
             if detected is not None:
                 try:
                     detected = int(detected)
-                    if detected in (0, 16, 64, 256):
+                    if detected in (0, 16, 64, 256, 1024, 4096):
                         rot_size = detected
                         print(f"[INT-Crush] Auto-detected rot_size={rot_size} from metadata")
                 except (ValueError, TypeError):
@@ -479,11 +627,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 
 def _requantize_int8(w_float):
-    """Re-quantize a float weight tensor to INT8 with per-channel scales.
+    """Re-quantize a float weight to INT8 with per-row scales.
 
-    Used by IntCrushInt8Ops.set_weight() when a LoRA patch produces a
-    float32 weight that needs to be stored back in INT8 format.  Computes
-    a single per-row scale (max-abs / 127), rounds, and clamps to [-128, 127].
+    Used by IntCrushInt8Ops.set_weight() when a LoRA patch produces a float weight.
+    Per-row scale: max-abs / 127, round, clamp to [-128, 127].
 
     Args:
         w_float: [out_features, in_features] float weight tensor
@@ -504,15 +651,8 @@ if _COMFY_OPS_AVAILABLE:
     class IntCrushInt8Ops(manual_cast):
         """Custom ComfyUI operations for INT-Crush INT8 quantization.
 
-        Detects INT8 weights in INT-Crush format:
-          .weight (int8) + .weight_scale (fp16, [out, 1])
-
-        When rot_size > 0, applies Hadamard rotation to activations to match
-        the rotated weight space from conversion.
-
-        Uses fused Triton kernels for W8A8 GEMM with dynamic per-token
-        activation quantization. Falls back to PyTorch when Triton is
-        unavailable.
+        Detects INT8 weights (.weight int8 + .weight_scale fp16), applies Hadamard
+        rotation when rot_size > 0, and uses fused Triton W8A8 GEMM kernels.
         """
 
         _rot_size_override = 0
@@ -577,6 +717,7 @@ if _COMFY_OPS_AVAILABLE:
                         state_dict.pop(scale_key, None)
                         state_dict.pop(perm_key, None)
                         state_dict.pop(bias_key, None)
+
                         return
 
                 super()._load_from_state_dict(
@@ -639,11 +780,13 @@ if _COMFY_OPS_AVAILABLE:
 
             @torch.no_grad()
             def forward(self, x: torch.Tensor) -> torch.Tensor:
-                # ── Fallback: non-quantized layers use the standard manual_cast path ──
+                p = _int8_profiler
+                # ── Fallback: non-quantized layers ──
                 if not self._is_int8:
                     return super().forward(x)
 
                 # ── ComfyUI weight casting (low-VRAM / offload mode) ──
+                p.start("cast")
                 need_cast = (
                     _MANUAL_CAST_AVAILABLE
                     and (
@@ -664,15 +807,24 @@ if _COMFY_OPS_AVAILABLE:
                     weight = self.weight
                     bias = self.bias
                     offload_stream = None
+                p.end("cast")
 
                 # ── Hadamard rotation ──
-                if self._rot_need:
+                # Only skip Python rotation when FHT kernel will be taken.
+                _pre_batch = x.reshape(-1, x.shape[-1]).shape[0]
+                use_fht = (
+                    self._rot_need and _TRITON_FHT
+                    and self._rot_size >= 256 and x.is_cuda
+                    and _pre_batch > 16
+                    and _TRITON_AVAILABLE
+                )
+                p.start("rotation")
+                if self._rot_need and not use_fht:
                     x = self._rotate(x)
+                p.end("rotation")
 
                 # ── Activation padding ──
-                # Rotation pads in_features to a multiple of rot_size during
-                # conversion, so the stored weight may be wider than the model's
-                # original in_features.
+                # Weight may be wider than model's in_features due to rotation padding.
                 w_in = weight.shape[1] if weight.dtype == torch.int8 else self.weight.shape[1]
                 if x.shape[-1] < w_in:
                     pad = w_in - x.shape[-1]
@@ -687,40 +839,72 @@ if _COMFY_OPS_AVAILABLE:
                     out = F.linear(x, weight, bias)
                     if need_cast and _MANUAL_CAST_AVAILABLE:
                         uncast_bias_weight(self, weight, bias, offload_stream)
+                    p.finish_call()
                     return out.to(x.dtype)
 
+                p.start("scale_xfer")
                 w_scale = self.weight_scale
                 if isinstance(w_scale, torch.Tensor) and w_scale.device != x.device:
                     w_scale = w_scale.to(x.device, non_blocking=True)
+                p.end("scale_xfer")
 
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
-
-                # Ensure weight & bias are on the compute device before branching
-                weight = weight.to(x.device, non_blocking=True)
-                if bias is not None:
-                    bias = bias.to(device=x.device, dtype=x.dtype)
+                batch = x_2d.shape[0]
 
                 # ── W8A8 GEMM: Triton fused kernel or PyTorch fallback ──
-                # Small batches (<=16) skip Triton to avoid kernel launch overhead.
-                if x_2d.shape[0] <= 16 or not _TRITON_AVAILABLE or not x.is_cuda:
+                if batch <= 16 or not _TRITON_AVAILABLE or not x.is_cuda:
+                    # Small batches: PyTorch fallback
+                    p.start("dequant_pytorch")
                     w_scale_2d = w_scale.reshape(-1, 1) if w_scale.ndim == 1 else w_scale
-                    w_float = (weight.float() * w_scale_2d).to(x.dtype)
+                    w_float = weight.to(compute_dtype) * w_scale_2d.to(compute_dtype)
+                    p.end("dequant_pytorch")
+                    p.start("gemm")
                     out = F.linear(x_2d, w_float, bias)
                     del w_float
-                else:
-                    # Fused INT8 GEMM + dequantization via Triton kernel
-                    x_int8, s_a = dynamic_quantize_activation(x_2d)
+                    p.end("gemm")
+                elif use_fht:
+                    # FHT: fused rotation + quantize (O(N log N) for large rot_sizes)
+                    p.start("fht_quantize")
+                    x_int8, s_a = fht_quantize_activation(x_2d, self._rot_size)
+                    p.end("fht_quantize")
+                    p.start("gemm")
                     out = fused_int8_gemm_dequant(
                         x_int8, weight, w_scale, s_a,
                         bias=bias, out_dtype=compute_dtype,
                     )
+                    del x_int8, s_a
+                    p.end("gemm")
+                elif (batch <= 32 or (batch <= 128 and x_2d.shape[1] <= 4096)
+                      ) and _HAS_FUSED_QUANT_GEMM and _TRITON_DYNQUANT:
+                    # Small M, moderate K: fused quantize+GEMM+dequant
+                    p.start("fused_quant_gemm")
+                    out = fused_quant_int8_gemm_dequant(
+                        x_2d, weight, w_scale,
+                        bias=bias, out_dtype=compute_dtype,
+                    )
+                    p.end("fused_quant_gemm")
+                else:
+                    # Large M: two-kernel path
+                    p.start("quantize")
+                    x_int8, s_a = dynamic_quantize_activation(x_2d)
+                    p.end("quantize")
+                    p.start("gemm")
+                    out = fused_int8_gemm_dequant(
+                        x_int8, weight, w_scale, s_a,
+                        bias=bias, out_dtype=compute_dtype,
+                    )
+                    del x_int8, s_a
+                    p.end("gemm")
 
+                p.start("uncast")
                 if need_cast and _MANUAL_CAST_AVAILABLE:
                     uncast_bias_weight(self, weight, bias, offload_stream)
+                p.end("uncast")
 
+                p.finish_call()
                 return out.reshape(*x_shape[:-1], -1)
 
             def _rotate(self, x: torch.Tensor) -> torch.Tensor:
@@ -754,7 +938,7 @@ class SimpleINT8UNetLoader:
             "required": {
                 "unet_name": (_get_diffusion_model_list(),),
                 "model_type": (["flux", "wan", "zimage", "chroma", "default"], {"default": "flux"}),
-                "rot_size": ([0, 16, 64, 256], {"default": 256}),
+                "rot_size": ([0, 16, 64, 256, 1024, 4096], {"default": 256}),
             },
         }
 
@@ -785,7 +969,7 @@ class SimpleINT8UNetLoader:
             if detected is not None:
                 try:
                     detected = int(detected)
-                    if detected in (0, 16, 64, 256):
+                    if detected in (0, 16, 64, 256, 1024, 4096):
                         rot_size = detected
                         print(f"[INT-Crush] INT8: Auto-detected rot_size={rot_size} from metadata")
                 except (ValueError, TypeError):

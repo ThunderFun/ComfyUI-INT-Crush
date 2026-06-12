@@ -124,9 +124,13 @@ def fused_w4a16_gemm(
     assert K_packed == K // 2, f"Packed dim mismatch: K={K}, K_packed={K_packed}"
 
     # Flatten to 2D
-    a_flat = activation.reshape(M, K).contiguous()
-    weight_packed = weight_packed.contiguous()
-    weight_scale = weight_scale.contiguous()
+    a_flat = activation.reshape(M, K)
+    if not a_flat.is_contiguous():
+        a_flat = a_flat.contiguous()
+    if not weight_packed.is_contiguous():
+        weight_packed = weight_packed.contiguous()
+    if not weight_scale.is_contiguous():
+        weight_scale = weight_scale.contiguous()
 
     # Triton works best with float16
     a_f16 = a_flat.to(torch.float16)
