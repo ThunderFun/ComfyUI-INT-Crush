@@ -62,11 +62,6 @@ except Exception:
     pass
 
 _TRITON_FHT = False
-try:
-    from .kernels.triton_fht import fht_quantize_activation
-    _TRITON_FHT = True
-except Exception:
-    pass
 
 if _TRITON_INT8_GEMM and _TRITON_DYNQUANT:
     _TRITON_AVAILABLE = True
