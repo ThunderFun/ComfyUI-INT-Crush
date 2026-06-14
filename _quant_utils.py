@@ -1,7 +1,12 @@
-"""Quantization utilities for INT-Crush INT4/INT8 inference.
+"""Quantization primitives for INT-Crush INT4/INT8 inference.
 
-Hadamard rotation, INT4/INT8 pack/unpack, per-group scale calculation,
-weight quantization, and activation scale calculation.
+Provides:
+  - Hadamard rotation (Regular for powers-of-4, Sylvester fallback)
+  - INT4 pack/unpack (two's complement, 2 values per uint8 byte)
+  - INT8 pack/unpack (identity; stored as plain int8)
+  - Per-group scale calculation for symmetric quantization
+  - Weight quantization (INT4 and INT8)
+  - Per-token activation scale calculation
 """
 
 import math
@@ -17,8 +22,9 @@ def _is_power_of_two(n: int) -> bool:
 def _is_power_of_four(n: int) -> bool:
     """Return True if n is a positive power of 4 (4, 16, 64, 256, ...).
 
-    Used to decide between Regular Hadamard (balanced row sums) and
-    Sylvester construction for the rotation matrix.
+    Used to choose between Regular Hadamard (balanced row sums, preferred
+    for rotation) and Sylvester construction (any power of 2, fallback).
+    See ConvRot (arXiv:2512.03673) for why balanced row sums matter.
     """
     if n < 4:
         return False
@@ -29,9 +35,11 @@ _H_cache: dict[tuple, torch.Tensor] = {}
 
 
 def make_hadamard_regular(n: int, dtype: torch.dtype = torch.float16, device: str = "cpu") -> torch.Tensor:
-    """Normalized Regular Hadamard matrix of size n (power of 4).
+    """Normalized Regular Hadamard matrix of size n (must be a power of 4).
 
-    Balanced row sums prevent outlier aggregation during rotation (ConvRot, arXiv:2512.03673).
+    Constructed via Kronecker products of the 4x4 base. Balanced row sums
+    (each row sums to ±1) prevent outlier aggregation during rotation
+    (ConvRot, arXiv:2512.03673).
     """
     if not _is_power_of_four(n):
         raise ValueError(f"Regular Hadamard requires power of 4, got {n}. Use rot_size=16/64/256/1024/4096.")
@@ -56,7 +64,13 @@ def make_hadamard_regular(n: int, dtype: torch.dtype = torch.float16, device: st
 
 
 def _make_hadamard_sylvester(n: int, dtype: torch.dtype = torch.float16, device: str = "cpu") -> torch.Tensor:
-    """Construct a normalized Sylvester Hadamard matrix of size n (any power of 2)."""
+    """Normalized Sylvester Hadamard matrix of size n (any power of 2).
+
+    Fallback for sizes that are not powers of 4 (e.g. 32, 128, 512).
+    """
+    key = (n, str(dtype), device, "sylvester")
+    if key in _H_cache:
+        return _H_cache[key]
     if not _is_power_of_two(n):
         raise ValueError(f"n must be a power of 2, got {n}")
     H = torch.tensor([[1.0]], dtype=dtype, device=device)
@@ -65,13 +79,17 @@ def _make_hadamard_sylvester(n: int, dtype: torch.dtype = torch.float16, device:
             torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=dtype, device=device),
             H,
         )
-    return H * (1.0 / math.sqrt(n))
+    H = H * (1.0 / math.sqrt(n))
+    _H_cache[key] = H
+    return H
 
 
 def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = None) -> torch.Tensor:
-    """Group-wise Hadamard rotation on activations.
+    """Apply group-wise Hadamard rotation to the last dimension of x.
 
-    Uses Regular Hadamard for powers of 4, Sylvester fallback otherwise.
+    Pads the feature dimension to a multiple of rot_size if needed, then
+    multiplies each group by the Hadamard matrix. Prefers Regular Hadamard
+    (powers of 4) with Sylvester fallback for other power-of-2 sizes.
     """
     if not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
@@ -98,13 +116,16 @@ def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = 
     return x_rot.reshape(*leading_shape, in_features)
 
 
+# ── INT4 constants ────────────────────────────────────────────────────────────
+
 INT4_MIN = -8
 INT4_MAX = 7
-INT4_SCALE_DIVISOR = 7.0
+INT4_SCALE_DIVISOR = 7.0  # abs(INT4_MIN) — maps [-8,7] to [-1.0, 1.0]
 DEFAULT_GROUP_SIZE = 128
 
 
 def validate_int4_range(tensor: torch.Tensor) -> None:
+    """Raise ValueError if any element falls outside the INT4 range [-8, 7]."""
     if tensor.numel() == 0:
         return
     if tensor.min() < INT4_MIN or tensor.max() > INT4_MAX:
@@ -115,7 +136,10 @@ def validate_int4_range(tensor: torch.Tensor) -> None:
 
 
 def pack_int4(values: torch.Tensor) -> torch.Tensor:
-    """Pack INT4 values: two's complement, low nibble = even index, uint8."""
+    """Pack INT4 values into uint8: low nibble = even index, high nibble = odd.
+
+    Two's complement encoding; odd-length tensors are zero-padded before packing.
+    """
     validate_int4_range(values)
     values = values.to(torch.int8)
     K = values.shape[-1]
@@ -127,7 +151,10 @@ def pack_int4(values: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_int4(packed: torch.Tensor, K: int) -> torch.Tensor:
-    """Unpack packed INT4 back to int8 values."""
+    """Unpack uint8-packed INT4 back to int8 values.
+
+    K is the original (unpacked) length; extra padding bytes are trimmed.
+    """
     low = (packed & 0x0F).to(torch.int8)
     high = ((packed >> 4) & 0x0F).to(torch.int8)
     low = torch.where(low >= 8, low - 16, low)
@@ -138,13 +165,15 @@ def unpack_int4(packed: torch.Tensor, K: int) -> torch.Tensor:
     return result[..., :K]
 
 
+# ── INT8 constants ────────────────────────────────────────────────────────────
+
 INT8_MIN = -128
 INT8_MAX = 127
-INT8_SCALE_DIVISOR = 127.0
+INT8_SCALE_DIVISOR = 127.0  # abs(INT8_MIN) — maps [-128,127] to [-1.0, 1.0]
 
 
 def pack_int8(values: torch.Tensor) -> torch.Tensor:
-    """INT8 is stored unpacked; just validate and cast."""
+    """Validate INT8 range and cast to int8 (no packing needed)."""
     if values.numel() > 0 and (values.min() < INT8_MIN or values.max() > INT8_MAX):
         raise ValueError(
             f"Values must be in [{INT8_MIN}, {INT8_MAX}], "
@@ -154,19 +183,15 @@ def pack_int8(values: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_int8(packed: torch.Tensor, K: int) -> torch.Tensor:
-    """INT8 unpack is a no-op."""
+    """Slice INT8 tensor to original length (no unpacking needed)."""
     return packed[..., :K]
 
 
 def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group scales for INT4 quantization (per-row when group_size == in_features).
+    """Per-group symmetric scales for INT4 quantization.
 
-    Args:
-        W: [out_features, in_features] weight tensor
-        group_size: number of channels per group
-
-    Returns:
-        scales: [out_features, num_groups] float16 per-group scales
+    When group_size == in_features this reduces to per-row quantization.
+    Scales are max-abs per group divided by INT4_SCALE_DIVISOR (7.0).
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
@@ -185,14 +210,10 @@ def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> t
 
 
 def calculate_scales_int8(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group scales for INT8 quantization (per-row when group_size == in_features).
+    """Per-group symmetric scales for INT8 quantization.
 
-    Args:
-        W: [out_features, in_features] weight tensor
-        group_size: number of channels per group
-
-    Returns:
-        scales: [out_features, num_groups] float16 per-group scales
+    When group_size == in_features this reduces to per-row quantization.
+    Scales are max-abs per group divided by INT8_SCALE_DIVISOR (127.0).
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
@@ -211,15 +232,10 @@ def calculate_scales_int8(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE)
 
 
 def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weights to INT4 using precomputed per-group scales (per-row when group_size == in_features).
+    """Quantize weights to INT4 using precomputed per-group scales.
 
-    Args:
-        W: [out_features, in_features] rotated weight tensor
-        scales: [out_features, num_groups] per-group scales
-        group_size: number of channels per group
-
-    Returns:
-        quantized: [out_features, in_features] INT4 values in [-8, 7]
+    Divides each group by its scale, rounds to nearest, and clamps to [-8, 7].
+    When group_size == in_features this is per-row quantization.
     """
     out_features, in_features = W.shape
     if in_features % group_size != 0:
@@ -235,15 +251,10 @@ def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = DE
 
 
 def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weights to INT8 using precomputed per-group scales (per-row when group_size == in_features).
+    """Quantize weights to INT8 using precomputed per-group scales.
 
-    Args:
-        W: [out_features, in_features] rotated weight tensor
-        scales: [out_features, num_groups] per-group scales
-        group_size: number of channels per group
-
-    Returns:
-        quantized: [out_features, in_features] INT8 values in [-128, 127]
+    Divides each group by its scale, rounds to nearest, and clamps to [-128, 127].
+    When group_size == in_features this is per-row quantization.
     """
     out_features, in_features = W.shape
     if in_features % group_size != 0:
@@ -259,14 +270,10 @@ def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor, group_size: int
 
 
 def calculate_activation_scales(x: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group scales for activation quantization (per-token when group_size == K).
+    """Per-group symmetric scales for activation quantization.
 
-    Args:
-        x: [..., K] activation tensor (float16), arbitrary leading dims
-        group_size: number of channels per group
-
-    Returns:
-        scales: [..., num_groups] float16 per-group scales
+    When group_size == K (last dimension) this reduces to per-token quantization.
+    Supports arbitrary leading batch dimensions.
     """
     orig_shape = x.shape
     K = orig_shape[-1]
@@ -282,5 +289,5 @@ def calculate_activation_scales(x: torch.Tensor, group_size: int = DEFAULT_GROUP
     max_vals = x_grouped.abs().amax(dim=2)
     scales = (max_vals / INT4_SCALE_DIVISOR).clamp(min=1e-8).to(torch.float16)
 
-    # Reshape to match leading dims: [..., num_groups]
+    # Restore leading batch dimensions: [..., num_groups]
     return scales.reshape(*orig_shape[:-1], num_groups)

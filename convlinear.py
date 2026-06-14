@@ -1,11 +1,12 @@
-"""ConvLinear4bit/ConvLinear8bit — W4A16/W8A16 inference modules.
+"""ConvLinear4bit/ConvLinear8bit — standalone quantized linear modules.
 
-Drop-in nn.Linear replacements with:
-  1. Group-wise Hadamard rotation on activations
-  2. Symmetric per-row INT4/INT8 quantization
+Drop-in nn.Linear replacements that perform:
+  1. Group-wise Hadamard rotation on activations (optional)
+  2. Per-row symmetric INT4/INT8 quantization of weights
   3. On-the-fly dequantization in forward()
 
-Weights: packed INT4 (uint8) or plain INT8 (int8) with per-row FP16 scales.
+INT4 weights are packed 2-per-byte (uint8); INT8 weights are plain int8.
+Both use per-row FP16 scales for dequantization.
 """
 
 import torch
@@ -17,9 +18,10 @@ from ._quant_utils import INT4_SCALE_DIVISOR
 
 
 class ConvLinear8bit(nn.Module):
-    """W8A8 linear layer with Hadamard rotation + per-row quantization.
+    """W8A16 linear layer with optional Hadamard rotation and per-row quantization.
 
-    Weights are stored as plain INT8 (int8) with per-row FP16 scales.
+    Weights are plain int8 with per-row FP16 scales. Dequantized to float16
+    in forward() before the matrix multiply.
     """
 
     def __init__(
@@ -44,7 +46,7 @@ class ConvLinear8bit(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: rotate -> dequant weights -> F.linear."""
+        """Forward: rotate activations → dequant weights → F.linear."""
         if self.rot_need:
             x_rot = _qu.rotate_activations(x, self.rot_size)
         else:
@@ -60,15 +62,11 @@ class ConvLinear8bit(nn.Module):
         rot_need: bool = True,
         rot_size: int = 256,
     ) -> "ConvLinear8bit":
-        """Convert an nn.Linear to ConvLinear8bit with per-row quantization.
+        """Convert an nn.Linear to ConvLinear8bit.
 
-        Args:
-            module: source nn.Linear (weights are read, not modified)
-            rot_need: whether to apply Hadamard rotation to the weight matrix
-            rot_size: Hadamard group size (power of 2)
-
-        Returns:
-            ConvLinear8bit with INT8 weights and per-row float16 scales
+        Optionally rotates the weight matrix with a Hadamard transform
+        before quantization. Per-row scales are computed from the rotated
+        (or original) weight's max absolute value.
         """
         if rot_need and not _qu._is_power_of_two(rot_size):
             raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
@@ -102,9 +100,10 @@ class ConvLinear8bit(nn.Module):
 
 
 class ConvLinear4bit(nn.Module):
-    """W4A4 linear layer with Hadamard rotation + per-row quantization.
+    """W4A16 linear layer with optional Hadamard rotation and per-row quantization.
 
-    Weights are stored as packed INT4 (uint8) with per-row FP16 scales.
+    Weights are packed INT4 (2 values per uint8 byte) with per-row FP16 scales.
+    Dequantized to float16 in forward() before the matrix multiply.
     """
 
     def __init__(
@@ -117,11 +116,11 @@ class ConvLinear4bit(nn.Module):
         perm: torch.Tensor | None = None,
     ):
         super().__init__()
-        self.in_features = weight.shape[-1] * 2  # packed: 2 values per byte
+        self.in_features = weight.shape[-1] * 2  # 2 INT4 values packed per byte
         self.out_features = weight.shape[-2]
         self.rot_need = rot_need
         self.rot_size = rot_size
-        self._perm = perm  # PermuQuant permutation indices
+        self._perm = perm  # optional PermuQuant channel permutation indices
         self.register_buffer("weight", weight)
         self.register_buffer("scale", scale)
 
@@ -131,13 +130,13 @@ class ConvLinear4bit(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: rotate -> permute -> dequant weights -> F.linear."""
+        """Forward: rotate → permute → dequant weights → F.linear."""
         if self.rot_need:
             x_rot = _qu.rotate_activations(x, self.rot_size)
         else:
             x_rot = x
 
-        # Apply PermuQuant permutation to activations if present
+        # Apply PermuQuant channel permutation if present.
         if self._perm is not None:
             x_rot = x_rot[..., self._perm.to(x_rot.device)]
 
@@ -153,17 +152,11 @@ class ConvLinear4bit(nn.Module):
         rot_size: int = 256,
         perm: torch.Tensor | None = None,
     ) -> "ConvLinear4bit":
-        """Convert an nn.Linear to ConvLinear4bit with per-row quantization.
+        """Convert an nn.Linear to ConvLinear4bit.
 
-        Args:
-            module: source nn.Linear (weights are read, not modified)
-            rot_need: whether to apply Hadamard rotation to the weight matrix
-            rot_size: Hadamard group size (power of 2)
-            perm: optional PermuQuant channel permutation indices applied to
-                  in_features before quantization
-
-        Returns:
-            ConvLinear4bit with packed INT4 (uint8) weights and per-row float16 scales
+        Optionally rotates the weight matrix with a Hadamard transform and
+        applies PermuQuant channel permutation before quantization. Per-row
+        scales are computed from the max absolute value of each output row.
         """
         if rot_need and not _qu._is_power_of_two(rot_size):
             raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
