@@ -69,7 +69,7 @@ class IntCrushInt4Layout:
     def state_dict_tensors(cls, qdata, params):
         tensors = {"": qdata, "weight_scale": params.scale}
         if params.perm is not None:
-            tensors["weight.perm"] = params.perm
+            tensors["weight_perm"] = params.perm
         if params.zp is not None:
             tensors["weight_zp"] = params.zp
         return tensors
@@ -149,7 +149,7 @@ class IntCrushInt8Layout:
     def state_dict_tensors(cls, qdata, params):
         tensors = {"": qdata, "weight_scale": params.scale}
         if params.perm is not None:
-            tensors["weight.perm"] = params.perm
+            tensors["weight_perm"] = params.perm
         return tensors
 
     @classmethod
@@ -205,12 +205,12 @@ def register_intcrush_layouts():
 
         QUANT_ALGOS.setdefault("int4_crush", {
             "storage_t": torch.uint8,
-            "parameters": {"weight_scale", "weight_zp", "weight.perm"},
+            "parameters": {"weight_scale", "weight_zp", "weight_perm"},
             "comfy_tensor_layout": "IntCrushInt4Layout",
         })
         QUANT_ALGOS.setdefault("int8_crush", {
             "storage_t": torch.int8,
-            "parameters": {"weight_scale", "weight.perm"},
+            "parameters": {"weight_scale", "weight_perm"},
             "comfy_tensor_layout": "IntCrushInt8Layout",
         })
     except ImportError:

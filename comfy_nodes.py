@@ -42,6 +42,7 @@ def _get_cast():
 _TRITON_AVAILABLE = False
 _TRITON_INT4_UNPACK = False
 _TRITON_W4A16_GEMM = False
+_TRITON_W4A8_GEMM = False
 _TRITON_INT8_GEMM = False
 _TRITON_INT4_INT8_UNPACK = False
 _TRITON_DYNQUANT = False
@@ -68,6 +69,12 @@ except Exception:
     pass
 
 try:
+    from .kernels.triton_w4a8_gemm import fused_w4a8_gemm_dequant
+    _TRITON_W4A8_GEMM = True
+except Exception:
+    pass
+
+try:
     from .kernels.triton_int8_gemm import fused_int8_gemm_dequant
     _TRITON_INT8_GEMM = True
 except Exception:
@@ -85,9 +92,12 @@ try:
 except Exception:
     pass
 
+if _TRITON_W4A8_GEMM and _TRITON_DYNQUANT and _TRITON_INT4_INT8_UNPACK:
+    print("[INT-Crush] Triton W4A8 GEMM + dynamic quantizer + INT4 unpack loaded")
 if _TRITON_INT8_GEMM and _TRITON_DYNQUANT:
     _TRITON_AVAILABLE = True
-    print("[INT-Crush] Triton INT8 GEMM + dynamic quantizer loaded")
+    if not _TRITON_W4A8_GEMM:
+        print("[INT-Crush] Triton INT8 GEMM + dynamic quantizer loaded (W4A8 will use W8A8 kernel)")
 if _TRITON_INT4_INT8_UNPACK:
     print("[INT-Crush] Triton INT4->INT8 unpack kernel loaded")
 
@@ -141,6 +151,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                 self._intcrush_rot_need = True
                 self._intcrush_rot_size = rot_size
                 self._intcrush_perm = None
+                self._intcrush_smooth = None
                 self.quant_format = None
                 self.layout_type = None
 
@@ -151,7 +162,8 @@ def _make_intcrush_ops(quant_format, rot_size):
                 weight_key = prefix + "weight"
                 scale_key = prefix + "weight_scale"
                 zp_key = prefix + "weight_zp"
-                perm_key = prefix + "weight.perm"
+                perm_key = prefix + "weight_perm"
+                smooth_key = prefix + "weight_smooth"
                 quant_key = prefix + "comfy_quant"
 
                 weight = state_dict.get(weight_key)
@@ -183,6 +195,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                 scale = state_dict.pop(scale_key)
                 zp = state_dict.pop(zp_key, None)
                 perm = state_dict.pop(perm_key, None)
+                smooth = state_dict.pop(smooth_key, None)
                 bias_tensor = state_dict.pop(prefix + "bias", None)
                 state_dict.pop(quant_key, None)
 
@@ -223,6 +236,9 @@ def _make_intcrush_ops(quant_format, rot_size):
 
                 self._intcrush_perm = params.perm
                 self._intcrush_w_in = self.in_features
+                self._intcrush_smooth = (
+                    smooth.float().to(device=device) if smooth is not None else None
+                )
 
                 self.weight = nn.Parameter(
                     QuantizedTensor(
@@ -242,13 +258,13 @@ def _make_intcrush_ops(quant_format, rot_size):
                     self.bias = None
 
                 if perm is not None:
-                    self.register_parameter("weight.perm",
+                    self.register_parameter("weight_perm",
                         nn.Parameter(perm.to(device=device), requires_grad=False))
                 if zp is not None:
                     self.register_parameter("weight_zp",
                         nn.Parameter(zp.to(device=device), requires_grad=False))
 
-                for k in (weight_key, scale_key, zp_key, perm_key,
+                for k in (weight_key, scale_key, zp_key, perm_key, smooth_key,
                           prefix + "bias", quant_key):
                     if k in missing_keys:
                         missing_keys.remove(k)
@@ -351,11 +367,14 @@ def _make_intcrush_ops(quant_format, rot_size):
                 if isinstance(weight._params, IntCrushInt4Layout.Params):
                     # Path 1: W4A8 — unpack INT4→INT8, dynamic-quantize activations,
                     # fused INT8 GEMM + dequant (fastest when all Triton kernels available).
+                    _have_w4a8_kernel = (
+                        (_TRITON_W4A8_GEMM or _TRITON_INT8_GEMM)
+                        and _TRITON_DYNQUANT
+                        and _TRITON_INT4_INT8_UNPACK
+                    )
                     if (not _use_pytorch and not _use_w4a16
                             and self._intcrush_rot_need
-                            and _TRITON_INT8_GEMM
-                            and _TRITON_DYNQUANT
-                            and _TRITON_INT4_INT8_UNPACK):
+                            and _have_w4a8_kernel):
 
                         x_2d = x.reshape(-1, x.shape[-1])
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
@@ -368,7 +387,8 @@ def _make_intcrush_ops(quant_format, rot_size):
                         x_int8, s_a = dynamic_quantize_activation(x_2d)
                         w_int8 = unpack_int4_to_int8(qdata, w_in)
                         scale_flat = weight._params.scale.reshape(-1).float().contiguous()
-                        out = fused_int8_gemm_dequant(
+                        _gemm_fn = fused_w4a8_gemm_dequant if _TRITON_W4A8_GEMM else fused_int8_gemm_dequant
+                        out = _gemm_fn(
                             x_int8, w_int8, scale_flat, s_a,
                             bias=bias, out_dtype=x.dtype,
                         )
@@ -428,6 +448,15 @@ def _make_intcrush_ops(quant_format, rot_size):
                         x_2d = F.pad(x_2d, (0, w_in - x_2d.shape[-1]))
                     if perm is not None:
                         x_2d = x_2d[..., perm]
+
+                    # SmoothQuant: apply inverse smoothing factors (1/λ).
+                    # The converter stores λ per-channel; at inference we
+                    # divide activations by λ to complete the transformation
+                    # Y = (X/λ) @ (λ·W).  Only present when --smoothquant
+                    # was used during conversion.
+                    smooth = self._intcrush_smooth
+                    if smooth is not None:
+                        x_2d = x_2d / smooth.to(device=x_2d.device, dtype=x_2d.dtype)
 
                     batch = x_2d.shape[0]
                     compute_dtype = (x_2d.dtype if x_2d.dtype in (torch.float16, torch.bfloat16)
