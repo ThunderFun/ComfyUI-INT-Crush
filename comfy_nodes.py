@@ -170,12 +170,12 @@ def _make_intcrush_ops(quant_format, rot_size):
                 scale = state_dict.get(scale_key)
 
                 # Detect INT-Crush format by dtype signature:
-                #   INT4: weight=uint8, scale=float16
-                #   INT8: weight=int8,  scale=float16
+                #   INT4: weight=uint8, scale=float16 or float32
+                #   INT8: weight=int8,  scale=float16 or float32
                 is_int4 = (weight is not None and scale is not None
-                           and weight.dtype == torch.uint8 and scale.dtype == torch.float16)
+                           and weight.dtype == torch.uint8 and scale.dtype in (torch.float16, torch.float32))
                 is_int8 = (weight is not None and scale is not None
-                           and weight.dtype == torch.int8 and scale.dtype == torch.float16)
+                           and weight.dtype == torch.int8 and scale.dtype in (torch.float16, torch.float32))
 
                 if not (is_int4 or is_int8):
                     # Not an INT-Crush layer — delegate to default loader.
@@ -321,43 +321,50 @@ def _make_intcrush_ops(quant_format, rot_size):
 
             @torch.no_grad()
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+
                 # ── Non-quantized fallback ──
                 if not self._intcrush_is_quantized:
                     return super().forward(x)
 
-                # ── ComfyUI weight casting (low-VRAM / offload) ──
-                # Check once: most layers have all False → short-circuit fast.
+                # ── ComfyUI weight casting (VBAR + low-VRAM) ──
                 wfn = self.weight_function
                 bfn = self.bias_function
                 need_cast = (
                     self.comfy_cast_weights
                     or wfn or bfn
-                    or self.weight_lowvram_function is not None
-                    or self.bias_lowvram_function is not None
+                    or getattr(self, "weight_lowvram_function", None) is not None
+                    or getattr(self, "bias_lowvram_function", None) is not None
                 )
 
+                QT = _get_qt()
+                uncast = None
+
                 if need_cast:
+                    weight_dtype = (
+                        self.weight._params.orig_dtype
+                        if isinstance(self.weight, QT) else x.dtype
+                    )
                     _cbw, _ucbw = _get_cast()
                     weight, bias, offload_stream = _cbw(
-                        self, input=None, dtype=torch.float16,
+                        self, input=None, dtype=weight_dtype,
                         device=x.device, bias_dtype=x.dtype, offloadable=True,
                     )
+                    uncast = lambda: _ucbw(self, weight, bias, offload_stream)
                 else:
                     weight = self.weight
                     bias = self.bias
 
-                QT = _get_qt()
+                def finish(out: torch.Tensor) -> torch.Tensor:
+                    if uncast is not None:
+                        uncast()
+                    return out.to(x.dtype).reshape(*x.shape[:-1], -1)
 
-                # Weight already dequantized (e.g. after LoRA).
+                # ── Weight already dequantized (e.g. wrapper patch ran) ──
                 if not isinstance(weight, QT):
                     x_2d = x.reshape(-1, x.shape[-1])
                     if self._intcrush_rot_need:
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
-                    out = F.linear(x_2d, weight, bias)
-                    if need_cast:
-                        _ucbw = _get_cast()[1]
-                        _ucbw(self, weight, bias, offload_stream)
-                    return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+                    return finish(F.linear(x_2d, weight, bias))
 
                 qdata = weight._qdata
                 w_in = self._intcrush_w_in
@@ -396,9 +403,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                             zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(torch.float16)
                             out = out - x_2d.sum(dim=-1, keepdim=True) * zp_cor
 
-                        if need_cast:
-                            _get_cast()[1](self, weight, bias, offload_stream)
-                        return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+                        return finish(out)
 
                     # Path 2: W4A16 — Triton unpack to float16, then cuBLAS GEMM.
                     if not _use_pytorch and _TRITON_INT4_UNPACK:
@@ -419,9 +424,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                             zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(torch.float16)
                             out = out - x_2d.sum(dim=-1, keepdim=True) * zp_cor
 
-                        if need_cast:
-                            _get_cast()[1](self, weight, bias, offload_stream)
-                        return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+                        return finish(out)
 
                     # Path 3: PyTorch fallback — full dequant to float, then F.linear.
                     w_float = IntCrushInt4Layout.dequantize(qdata, weight._params).to(x.device, x.dtype)
@@ -430,11 +433,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
                     if perm is not None:
                         x_2d = x_2d[..., perm]
-                    out = F.linear(x_2d, w_float)
-
-                    if need_cast:
-                        _get_cast()[1](self, weight, bias, offload_stream)
-                    return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+                    return finish(F.linear(x_2d, w_float))
 
                 # ── INT8 forward paths ──
                 if isinstance(weight._params, IntCrushInt8Layout.Params):
@@ -482,9 +481,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                             bias=bias, out_dtype=compute_dtype,
                         )
 
-                    if need_cast:
-                        _get_cast()[1](self, weight, bias, offload_stream)
-                    return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+                    return finish(out)
 
                 # Unknown layout — delegate to standard manual_cast forward.
                 return super().forward(x)
