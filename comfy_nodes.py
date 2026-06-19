@@ -152,6 +152,9 @@ def _make_intcrush_ops(quant_format, rot_size):
                 self._intcrush_rot_size = rot_size
                 self._intcrush_perm = None
                 self._intcrush_smooth = None
+                self._intcrush_smoothrot_factors = None
+                self._intcrush_L1 = None
+                self._intcrush_L2 = None
                 self.quant_format = None
                 self.layout_type = None
 
@@ -164,7 +167,10 @@ def _make_intcrush_ops(quant_format, rot_size):
                 zp_key = prefix + "weight_zp"
                 perm_key = prefix + "weight_perm"
                 smooth_key = prefix + "weight_smooth"
+                smoothrot_key = prefix + "weight_smoothrot_factors"
                 quant_key = prefix + "comfy_quant"
+                L1_key = prefix + "weight_L1"
+                L2_key = prefix + "weight_L2"
 
                 weight = state_dict.get(weight_key)
                 scale = state_dict.get(scale_key)
@@ -196,6 +202,9 @@ def _make_intcrush_ops(quant_format, rot_size):
                 zp = state_dict.pop(zp_key, None)
                 perm = state_dict.pop(perm_key, None)
                 smooth = state_dict.pop(smooth_key, None)
+                smoothrot_factors = state_dict.pop(smoothrot_key, None)
+                L1 = state_dict.pop(L1_key, None)
+                L2 = state_dict.pop(L2_key, None)
                 bias_tensor = state_dict.pop(prefix + "bias", None)
                 state_dict.pop(quant_key, None)
 
@@ -239,6 +248,18 @@ def _make_intcrush_ops(quant_format, rot_size):
                 self._intcrush_smooth = (
                     smooth.float().to(device=device) if smooth is not None else None
                 )
+                # SmoothRot factors: applied BEFORE Hadamard (1/s → R).
+                # Distinct from _intcrush_smooth which is applied AFTER (R → /s).
+                self._intcrush_smoothrot_factors = (
+                    smoothrot_factors.float().to(device=device) if smoothrot_factors is not None else None
+                )
+                # SVD low-rank factors: FP16 branch absorbed before quantization.
+                self._intcrush_L1 = (
+                    L1.to(device=device, dtype=torch.float16) if L1 is not None else None
+                )
+                self._intcrush_L2 = (
+                    L2.to(device=device, dtype=torch.float16) if L2 is not None else None
+                )
 
                 self.weight = nn.Parameter(
                     QuantizedTensor(
@@ -265,7 +286,7 @@ def _make_intcrush_ops(quant_format, rot_size):
                         nn.Parameter(zp.to(device=device), requires_grad=False))
 
                 for k in (weight_key, scale_key, zp_key, perm_key, smooth_key,
-                          prefix + "bias", quant_key):
+                          smoothrot_key, L1_key, L2_key, prefix + "bias", quant_key):
                     if k in missing_keys:
                         missing_keys.remove(k)
 
@@ -326,6 +347,14 @@ def _make_intcrush_ops(quant_format, rot_size):
                 if not self._intcrush_is_quantized:
                     return super().forward(x)
 
+                # ── SVD low-rank branch (computed on raw input, before rotation) ──
+                svd_L1 = self._intcrush_L1
+                svd_L2 = self._intcrush_L2
+                has_svd = svd_L1 is not None and svd_L2 is not None
+                if has_svd:
+                    svd_L1 = svd_L1.to(device=x.device, dtype=torch.float16)
+                    svd_L2 = svd_L2.to(device=x.device, dtype=torch.float16)
+
                 # ── ComfyUI weight casting (VBAR + low-VRAM) ──
                 wfn = self.weight_function
                 bfn = self.bias_function
@@ -362,9 +391,18 @@ def _make_intcrush_ops(quant_format, rot_size):
                 # ── Weight already dequantized (e.g. wrapper patch ran) ──
                 if not isinstance(weight, QT):
                     x_2d = x.reshape(-1, x.shape[-1])
+                    # SmoothRot: 1/s BEFORE Hadamard.
+                    smoothrot_factors = self._intcrush_smoothrot_factors
+                    if smoothrot_factors is not None:
+                        x_2d = x_2d / smoothrot_factors.to(device=x_2d.device, dtype=x_2d.dtype)
                     if self._intcrush_rot_need:
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
-                    return finish(F.linear(x_2d, weight, bias))
+                    out = F.linear(x_2d, weight, bias)
+                    if has_svd:
+                        x_raw = x.reshape(-1, x.shape[-1])
+                        lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                        out = out + lr_out.to(out.dtype)
+                    return finish(out)
 
                 qdata = weight._qdata
                 w_in = self._intcrush_w_in
@@ -384,6 +422,11 @@ def _make_intcrush_ops(quant_format, rot_size):
                             and _have_w4a8_kernel):
 
                         x_2d = x.reshape(-1, x.shape[-1])
+
+                        # SmoothRot: 1/s BEFORE Hadamard.
+                        smoothrot_factors = self._intcrush_smoothrot_factors
+                        if smoothrot_factors is not None:
+                            x_2d = x_2d / smoothrot_factors.to(device=x_2d.device, dtype=x_2d.dtype)
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
 
                         if x_2d.shape[-1] < w_in:
@@ -403,12 +446,22 @@ def _make_intcrush_ops(quant_format, rot_size):
                             zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(torch.float16)
                             out = out - x_2d.sum(dim=-1, keepdim=True) * zp_cor
 
+                        if has_svd:
+                            x_raw = x.reshape(-1, x.shape[-1])
+                            lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                            out = out + lr_out.to(out.dtype)
+
                         return finish(out)
 
                     # Path 2: W4A16 — Triton unpack to float16, then cuBLAS GEMM.
                     if not _use_pytorch and _TRITON_INT4_UNPACK:
 
                         x_2d = x.reshape(-1, x.shape[-1])
+
+                        # SmoothRot: 1/s BEFORE Hadamard.
+                        smoothrot_factors = self._intcrush_smoothrot_factors
+                        if smoothrot_factors is not None:
+                            x_2d = x_2d / smoothrot_factors.to(device=x_2d.device, dtype=x_2d.dtype)
                         if self._intcrush_rot_need:
                             x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
 
@@ -424,22 +477,43 @@ def _make_intcrush_ops(quant_format, rot_size):
                             zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(torch.float16)
                             out = out - x_2d.sum(dim=-1, keepdim=True) * zp_cor
 
+                        if has_svd:
+                            x_raw = x.reshape(-1, x.shape[-1])
+                            lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                            out = out + lr_out.to(out.dtype)
+
                         return finish(out)
 
                     # Path 3: PyTorch fallback — full dequant to float, then F.linear.
                     w_float = IntCrushInt4Layout.dequantize(qdata, weight._params).to(x.device, x.dtype)
                     x_2d = x.reshape(-1, x.shape[-1])
+
+                    # SmoothRot: 1/s BEFORE Hadamard.
+                    smoothrot_factors = self._intcrush_smoothrot_factors
+                    if smoothrot_factors is not None:
+                        x_2d = x_2d / smoothrot_factors.to(device=x_2d.device, dtype=x_2d.dtype)
                     if self._intcrush_rot_need:
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
                     if perm is not None:
                         x_2d = x_2d[..., perm]
-                    return finish(F.linear(x_2d, w_float))
+                    out = F.linear(x_2d, w_float)
+                    if has_svd:
+                        x_raw = x.reshape(-1, x.shape[-1])
+                        lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                        out = out + lr_out.to(out.dtype)
+                    return finish(out)
 
                 # ── INT8 forward paths ──
                 if isinstance(weight._params, IntCrushInt8Layout.Params):
                     w_scale = weight._params.scale
 
                     x_2d = x.reshape(-1, x.shape[-1])
+
+                    # SmoothRot: apply 1/s BEFORE Hadamard (correct order).
+                    # Old SmoothQuant: apply 1/s AFTER Hadamard (legacy order).
+                    smoothrot_factors = self._intcrush_smoothrot_factors
+                    if smoothrot_factors is not None:
+                        x_2d = x_2d / smoothrot_factors.to(device=x_2d.device, dtype=x_2d.dtype)
                     if self._intcrush_rot_need:
                         x_2d = rotate_activations(x_2d, self._intcrush_rot_size)
 
@@ -448,14 +522,11 @@ def _make_intcrush_ops(quant_format, rot_size):
                     if perm is not None:
                         x_2d = x_2d[..., perm]
 
-                    # SmoothQuant: apply inverse smoothing factors (1/λ).
-                    # The converter stores λ per-channel; at inference we
-                    # divide activations by λ to complete the transformation
-                    # Y = (X/λ) @ (λ·W).  Only present when --smoothquant
-                    # was used during conversion.
-                    smooth = self._intcrush_smooth
-                    if smooth is not None:
-                        x_2d = x_2d / smooth.to(device=x_2d.device, dtype=x_2d.dtype)
+                    # Old SmoothQuant: 1/s AFTER Hadamard (only for non-SmoothRot layers).
+                    if smoothrot_factors is None:
+                        smooth = self._intcrush_smooth
+                        if smooth is not None:
+                            x_2d = x_2d / smooth.to(device=x_2d.device, dtype=x_2d.dtype)
 
                     batch = x_2d.shape[0]
                     compute_dtype = (x_2d.dtype if x_2d.dtype in (torch.float16, torch.bfloat16)
@@ -480,6 +551,11 @@ def _make_intcrush_ops(quant_format, rot_size):
                             x_int8, qdata, w_scale, s_a,
                             bias=bias, out_dtype=compute_dtype,
                         )
+
+                    if has_svd:
+                        x_raw = x.reshape(-1, x.shape[-1])
+                        lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                        out = out + lr_out.to(out.dtype)
 
                     return finish(out)
 
