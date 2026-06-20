@@ -13,10 +13,37 @@ import math
 import torch
 import torch.nn.functional as F
 
+__all__ = [
+    "make_hadamard_regular",
+    "is_power_of_two",
+    "rotate_activations",
+    "pack_int4",
+    "unpack_int4",
+    "pack_int8",
+    "unpack_int8",
+    "validate_int4_range",
+    "calculate_scales",
+    "calculate_scales_int8",
+    "quantize_weights",
+    "quantize_weights_int8",
+    "INT4_MIN",
+    "INT4_MAX",
+    "INT4_SCALE_DIVISOR",
+    "INT4_TWOS_COMPLEMENT_BIAS",
+    "INT8_MIN",
+    "INT8_MAX",
+    "INT8_SCALE_DIVISOR",
+    "DEFAULT_GROUP_SIZE",
+]
+
 
 def _is_power_of_two(n: int) -> bool:
     """Return True if n is a positive power of 2 (1, 2, 4, 8, ...)."""
     return n > 0 and (n & (n - 1)) == 0
+
+
+# Public alias — used by convlinear.py to validate rot_size.
+is_power_of_two = _is_power_of_two
 
 
 def _is_power_of_four(n: int) -> bool:
@@ -31,6 +58,9 @@ def _is_power_of_four(n: int) -> bool:
     return (n & (n - 1)) == 0 and (n & 0x55555555) == n
 
 
+# Cache for precomputed Hadamard matrices.  Keyed by (n, dtype-str, device, [variant]).
+# Intentionally unbounded — the set of distinct (n, dtype, device) tuples is tiny in practice
+# (typical models use rot_size 16–4096 with float16 on a single GPU).
 _H_cache: dict[tuple, torch.Tensor] = {}
 
 
@@ -120,7 +150,8 @@ def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = 
 
 INT4_MIN = -8
 INT4_MAX = 7
-INT4_SCALE_DIVISOR = 7.0  # abs(INT4_MIN) — maps [-8,7] to [-1.0, 1.0]
+INT4_SCALE_DIVISOR = 7.0  # INT4_MAX — symmetric-quant divisor; scale = max_abs / 7, q = round(W/scale) clamped to [-8, 7]
+INT4_TWOS_COMPLEMENT_BIAS = 1 << 4  # 16 — two's complement bias for 4-bit signed-to-unsigned encoding
 DEFAULT_GROUP_SIZE = 128
 
 
@@ -146,7 +177,7 @@ def pack_int4(values: torch.Tensor) -> torch.Tensor:
     if K % 2 != 0:
         pad = torch.zeros(*values.shape[:-1], 1, dtype=values.dtype, device=values.device)
         values = torch.cat([values, pad], dim=-1)
-    q_i8 = torch.where(values < 0, 2 ** 4 + values, values).to(torch.uint8)
+    q_i8 = torch.where(values < 0, INT4_TWOS_COMPLEMENT_BIAS + values, values).to(torch.uint8)
     return q_i8[..., 0::2] | (q_i8[..., 1::2] << 4)
 
 
@@ -169,7 +200,7 @@ def unpack_int4(packed: torch.Tensor, K: int) -> torch.Tensor:
 
 INT8_MIN = -128
 INT8_MAX = 127
-INT8_SCALE_DIVISOR = 127.0  # abs(INT8_MIN) — maps [-128,127] to [-1.0, 1.0]
+INT8_SCALE_DIVISOR = 127.0  # INT8_MAX — symmetric-quant divisor; scale = max_abs / 127, q = round(W/scale) clamped to [-128, 127]
 
 
 def pack_int8(values: torch.Tensor) -> torch.Tensor:
@@ -187,107 +218,77 @@ def unpack_int8(packed: torch.Tensor, K: int) -> torch.Tensor:
     return packed[..., :K]
 
 
-def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group symmetric scales for INT4 quantization.
+# ── Shared helpers ───────────────────────────────────────────────────────────
 
-    When group_size == in_features this reduces to per-row quantization.
-    Scales are max-abs per group divided by INT4_SCALE_DIVISOR (7.0).
+def _pad_to_group_multiple(W: torch.Tensor, group_size: int) -> tuple[torch.Tensor, int]:
+    """Pad the feature (last) dimension of a 2-D weight tensor to a multiple of group_size.
+
+    Returns (W_padded, in_features) where in_features is the padded size.
     """
-    if W.dim() != 2:
-        raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
-
-    out_features, in_features = W.shape
+    in_features = W.shape[1]
     if in_features % group_size != 0:
         pad = group_size - (in_features % group_size)
         W = F.pad(W, (0, pad))
         in_features = W.shape[1]
+    return W, in_features
+
+
+def _calculate_scales(W: torch.Tensor, scale_divisor: float,
+                      group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
+    """Per-group symmetric scales: max-abs per group / scale_divisor.
+
+    When group_size == in_features this reduces to per-row quantization.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
+
+    out_features = W.shape[0]
+    W, in_features = _pad_to_group_multiple(W, group_size)
 
     num_groups = in_features // group_size
     W_grouped = W.reshape(out_features, num_groups, group_size)
     max_vals = W_grouped.abs().amax(dim=2)
-    scales = (max_vals / INT4_SCALE_DIVISOR).clamp(min=1e-8).to(torch.float16)
-    return scales
+    return (max_vals / scale_divisor).clamp(min=1e-8).to(torch.float16)
+
+
+def _quantize_weights(W: torch.Tensor, scales: torch.Tensor,
+                      clamp_min: int, clamp_max: int,
+                      group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
+    """Quantize weights using precomputed per-group scales.
+
+    Divides each group by its scale, rounds to nearest, clamps to [clamp_min, clamp_max].
+    When group_size == in_features this is per-row quantization.
+    """
+    out_features = W.shape[0]
+    W, in_features = _pad_to_group_multiple(W, group_size)
+
+    num_groups = in_features // group_size
+    W_grouped = W.reshape(out_features, num_groups, group_size)
+    W_scaled = W_grouped / scales.unsqueeze(2).to(W.dtype)
+    W_rounded = W_scaled.round().clamp(clamp_min, clamp_max)
+    return W_rounded.reshape(out_features, in_features).to(torch.int8)
+
+
+# ── Typed wrappers for backward compatibility ────────────────────────────────
+
+def calculate_scales(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
+    """Per-group symmetric scales for INT4 quantization (divisor=7.0)."""
+    return _calculate_scales(W, INT4_SCALE_DIVISOR, group_size)
 
 
 def calculate_scales_int8(W: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group symmetric scales for INT8 quantization.
-
-    When group_size == in_features this reduces to per-row quantization.
-    Scales are max-abs per group divided by INT8_SCALE_DIVISOR (127.0).
-    """
-    if W.dim() != 2:
-        raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
-
-    out_features, in_features = W.shape
-    if in_features % group_size != 0:
-        pad = group_size - (in_features % group_size)
-        W = F.pad(W, (0, pad))
-        in_features = W.shape[1]
-
-    num_groups = in_features // group_size
-    W_grouped = W.reshape(out_features, num_groups, group_size)
-    max_vals = W_grouped.abs().amax(dim=2)
-    scales = (max_vals / INT8_SCALE_DIVISOR).clamp(min=1e-8).to(torch.float16)
-    return scales
+    """Per-group symmetric scales for INT8 quantization (divisor=127.0)."""
+    return _calculate_scales(W, INT8_SCALE_DIVISOR, group_size)
 
 
 def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weights to INT4 using precomputed per-group scales.
-
-    Divides each group by its scale, rounds to nearest, and clamps to [-8, 7].
-    When group_size == in_features this is per-row quantization.
-    """
-    out_features, in_features = W.shape
-    if in_features % group_size != 0:
-        pad = group_size - (in_features % group_size)
-        W = F.pad(W, (0, pad))
-        in_features = W.shape[1]
-
-    num_groups = in_features // group_size
-    W_grouped = W.reshape(out_features, num_groups, group_size)
-    W_scaled = W_grouped / scales.unsqueeze(2).to(W.dtype)
-    W_rounded = W_scaled.round().clamp(INT4_MIN, INT4_MAX)
-    return W_rounded.reshape(out_features, in_features).to(torch.int8)
+    """Quantize weights to INT4 (clamp [-8, 7])."""
+    return _quantize_weights(W, scales, INT4_MIN, INT4_MAX, group_size)
 
 
 def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Quantize weights to INT8 using precomputed per-group scales.
-
-    Divides each group by its scale, rounds to nearest, and clamps to [-128, 127].
-    When group_size == in_features this is per-row quantization.
-    """
-    out_features, in_features = W.shape
-    if in_features % group_size != 0:
-        pad = group_size - (in_features % group_size)
-        W = F.pad(W, (0, pad))
-        in_features = W.shape[1]
-
-    num_groups = in_features // group_size
-    W_grouped = W.reshape(out_features, num_groups, group_size)
-    W_scaled = W_grouped / scales.unsqueeze(2).to(W.dtype)
-    W_rounded = W_scaled.round().clamp(INT8_MIN, INT8_MAX)
-    return W_rounded.reshape(out_features, in_features).to(torch.int8)
+    """Quantize weights to INT8 (clamp [-128, 127])."""
+    return _quantize_weights(W, scales, INT8_MIN, INT8_MAX, group_size)
 
 
-def calculate_activation_scales(x: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Per-group symmetric scales for activation quantization.
 
-    When group_size == K (last dimension) this reduces to per-token quantization.
-    Supports arbitrary leading batch dimensions.
-    """
-    orig_shape = x.shape
-    K = orig_shape[-1]
-    x_flat = x.reshape(-1, K)
-
-    if K % group_size != 0:
-        pad = group_size - (K % group_size)
-        x_flat = F.pad(x_flat, (0, pad))
-        K = x_flat.shape[1]
-
-    num_groups = K // group_size
-    x_grouped = x_flat.reshape(x_flat.shape[0], num_groups, group_size)
-    max_vals = x_grouped.abs().amax(dim=2)
-    scales = (max_vals / INT4_SCALE_DIVISOR).clamp(min=1e-8).to(torch.float16)
-
-    # Restore leading batch dimensions: [..., num_groups]
-    return scales.reshape(*orig_shape[:-1], num_groups)

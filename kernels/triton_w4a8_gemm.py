@@ -19,6 +19,11 @@ import torch
 import triton
 import triton.language as tl
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+# L2-cache-friendly row grouping for the output-tile swizzle.
+_GROUP_M: int = 8
+
 
 _configs_w4a8 = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=3, num_warps=4),
@@ -143,7 +148,6 @@ def fused_w4a8_gemm_dequant(
     else:
         c = torch.empty((M, N), dtype=out_dtype, device=x_int8.device)
 
-    GROUP_M = 8
     has_bias = bias is not None
     if not has_bias:
         bias = x_int8.new_empty(0, dtype=x_int8.dtype)  # dummy; kernel won't read it
@@ -158,8 +162,11 @@ def fused_w4a8_gemm_dequant(
         x_int8.stride(0), x_int8.stride(1),
         w_int8.stride(1), w_int8.stride(0),
         c.stride(0), c.stride(1),
-        GROUP_M=GROUP_M,
+        GROUP_M=_GROUP_M,
         HAS_BIAS=has_bias,
     )
 
     return c
+
+
+__all__ = ["fused_w4a8_gemm_dequant"]

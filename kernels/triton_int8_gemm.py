@@ -15,6 +15,17 @@ import torch
 import triton
 import triton.language as tl
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+# L2-cache-friendly row grouping for the output-tile swizzle.  Standard
+# Triton matmul heuristic — increasing GROUP_M > 8 hurts at small M.
+_GROUP_M: int = 8
+
+# Fused activation function IDs (matched by the Triton kernel's ACTIVATION param).
+ACT_NONE: int = 0
+ACT_SILU: int = 1   # x * sigmoid(x)
+ACT_GELU: int = 2   # 0.5 * x * (1 + erf(x / sqrt(2)))
+
 
 _configs_gemm = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=3, num_warps=4),
@@ -108,8 +119,8 @@ def _fused_int8_gemm_dequant_kernel(
     # Fused activation epilogue
     if ACTIVATION == 1:  # SiLU: x * sigmoid(x)
         acc_f32 = acc_f32 * tl.sigmoid(acc_f32)
-    elif ACTIVATION == 2:  # GELU (approximate)
-        acc_f32 = acc_f32 * 0.5 * (1.0 + tl.erf(acc_f32 * 0.7071067811865476))
+    elif ACTIVATION == 2:  # GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+        acc_f32 = acc_f32 * 0.5 * (1.0 + tl.erf(acc_f32 * 0.7071067811865476))  # 1/sqrt(2)
 
     # Fused residual add epilogue
     if HAS_RESIDUAL:
@@ -164,7 +175,6 @@ def fused_int8_gemm_dequant(
     else:
         c = torch.empty((M, N), dtype=out_dtype, device=x_int8.device)
 
-    GROUP_M = 8
     has_bias = bias is not None
     if not has_bias:
         bias = x_int8.new_empty(0, dtype=x_int8.dtype)  # dummy; kernel won't read it
@@ -186,7 +196,7 @@ def fused_int8_gemm_dequant(
         c.stride(0), c.stride(1),
         residual.stride(0) if has_residual else 0,
         residual.stride(1) if has_residual else 0,
-        GROUP_M=GROUP_M,
+        GROUP_M=_GROUP_M,
         HAS_BIAS=has_bias,
         ACTIVATION=activation,
         HAS_RESIDUAL=has_residual,
@@ -340,7 +350,6 @@ def fused_quant_int8_gemm_dequant(
     else:
         c = torch.empty((M, N), dtype=out_dtype, device=x_fp16.device)
 
-    GROUP_M = 8
     has_bias = bias is not None
     if not has_bias:
         bias = x_fp16.new_empty(0, dtype=x_fp16.dtype)  # dummy
@@ -357,7 +366,7 @@ def fused_quant_int8_gemm_dequant(
         x_contig.stride(0), x_contig.stride(1),
         w_int8.stride(1), w_int8.stride(0),
         c.stride(0), c.stride(1),
-        GROUP_M=GROUP_M,
+        GROUP_M=_GROUP_M,
         HAS_BIAS=has_bias,
     )
 
@@ -495,8 +504,6 @@ def int8_gemm_int8out(
     else:
         s_c = torch.empty(M, dtype=torch.float32, device=x_int8.device)
 
-    GROUP_M = 8
-
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
 
@@ -507,7 +514,17 @@ def int8_gemm_int8out(
         x_int8.stride(0), x_int8.stride(1),
         w_int8.stride(1), w_int8.stride(0),
         c.stride(0), c.stride(1),
-        GROUP_M=GROUP_M,
+        GROUP_M=_GROUP_M,
     )
 
     return c, s_c
+
+
+__all__ = [
+    "fused_int8_gemm_dequant",
+    "fused_quant_int8_gemm_dequant",
+    "int8_gemm_int8out",
+    "ACT_NONE",
+    "ACT_SILU",
+    "ACT_GELU",
+]

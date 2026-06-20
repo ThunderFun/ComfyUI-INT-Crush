@@ -16,6 +16,31 @@ import torch.nn.functional as F
 from . import _quant_utils as _qu
 from ._quant_utils import INT4_SCALE_DIVISOR
 
+__all__ = ["ConvLinear4bit", "ConvLinear8bit"]
+
+
+def _prepare_rotated_weight(
+    module: torch.nn.Linear,
+    rot_need: bool,
+    rot_size: int,
+    perm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Get the float weight matrix, optionally rotated and permuted.
+
+    1. If *rot_need*, apply Hadamard rotation (rot_size is validated as power-of-2).
+    2. If *perm* is provided, apply PermuQuant channel permutation (column-select).
+    Returns a 2-D float tensor ready for scale/quantize.
+    """
+    if rot_need and not _qu.is_power_of_two(rot_size):
+        raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
+
+    W = module.weight.float()
+    if rot_need:
+        W = _qu.rotate_activations(W, rot_size)
+    if perm is not None:
+        W = W[:, perm]
+    return W
+
 
 class ConvLinear8bit(nn.Module):
     """W8A16 linear layer with optional Hadamard rotation and per-row quantization.
@@ -68,14 +93,7 @@ class ConvLinear8bit(nn.Module):
         before quantization. Per-row scales are computed from the rotated
         (or original) weight's max absolute value.
         """
-        if rot_need and not _qu._is_power_of_two(rot_size):
-            raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
-
-        if rot_need:
-            W = module.weight.float()
-            weight_matrix = _qu.rotate_activations(W, rot_size)
-        else:
-            weight_matrix = module.weight.float()
+        weight_matrix = _prepare_rotated_weight(module, rot_need, rot_size)
 
         in_features = weight_matrix.shape[1]
         weight_scales = _qu.calculate_scales_int8(weight_matrix, in_features)
@@ -158,17 +176,7 @@ class ConvLinear4bit(nn.Module):
         applies PermuQuant channel permutation before quantization. Per-row
         scales are computed from the max absolute value of each output row.
         """
-        if rot_need and not _qu._is_power_of_two(rot_size):
-            raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
-
-        if rot_need:
-            W = module.weight.float()
-            weight_matrix = _qu.rotate_activations(W, rot_size)
-        else:
-            weight_matrix = module.weight.float()
-
-        if perm is not None:
-            weight_matrix = weight_matrix[:, perm]
+        weight_matrix = _prepare_rotated_weight(module, rot_need, rot_size, perm)
 
         in_features = weight_matrix.shape[1]
         weight_scales = _qu.calculate_scales(weight_matrix, in_features)

@@ -1,10 +1,10 @@
-"""Tests for loader.convlinear — ConvLinear4bit module."""
+"""Tests for convlinear — ConvLinear4bit standalone module."""
 
-import importlib
 import torch
 import pytest
 
-ConvLinear4bit = importlib.import_module("ComfyUI-INT-Crush.convlinear").ConvLinear4bit
+from _intcrush import load as _load
+ConvLinear4bit = _load("convlinear").ConvLinear4bit
 
 
 class TestConvLinear4bit:

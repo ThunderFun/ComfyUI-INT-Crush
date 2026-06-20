@@ -4,21 +4,22 @@ CPU fallback paths are tested unconditionally; Triton/GPU paths require
 CUDA and are skipped when unavailable.
 """
 
-import importlib
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-# ── Imports via the conftest-registered package ──────────────────────────────
+# ── Imports via the centralized test helpers ─────────────────────────────────
 
-_quant = importlib.import_module("ComfyUI-INT-Crush.kernels.triton_quantize")
+from _intcrush import load as _load
+from _fixtures import make_int8_inputs
+
+_quant = _load("kernels.triton_quantize")
 dynamic_quantize_activation = _quant.dynamic_quantize_activation
 fused_layernorm_quantize = _quant.fused_layernorm_quantize
 fused_rmsnorm_quantize = _quant.fused_rmsnorm_quantize
 fused_softmax_quantize = _quant.fused_softmax_quantize
 
-_int8_gemm = importlib.import_module("ComfyUI-INT-Crush.kernels.triton_int8_gemm")
+_int8_gemm = _load("kernels.triton_int8_gemm")
 fused_int8_gemm_dequant = _int8_gemm.fused_int8_gemm_dequant
 int8_gemm_int8out = _int8_gemm.int8_gemm_int8out
 
@@ -72,22 +73,6 @@ def _assert_int8_close(test, ref, label, atol_q=1, atol_s=1e-4):
     q_err = (test.float() - ref.float()).abs().max().item()
     assert q_err <= atol_q, f"{label}: int8 max err {q_err} > {atol_q}"
     return q_err
-
-
-def _make_int8_inputs(M, N, K, device="cpu"):
-    """Create random int8 activations, weights, and scales for GEMM.
-
-    Scales are chosen to keep dequantized values within fp16 range.
-    Typical real-world scales are 0.001–0.1 (not the [0, 1] range that
-    would overflow fp16 for large K).
-    """
-    x_int8 = torch.randint(-128, 127, (M, K), dtype=torch.int8, device=device)
-    w_int8 = torch.randint(-128, 127, (N, K), dtype=torch.int8, device=device)
-    # max |dequant| ≈ K * 127 * 127 * s_a * s_w; keep under ~30 000 for fp16.
-    max_scale = min(0.1, 30_000.0 / (K * 127 * 127))
-    s_a = (torch.rand(M, dtype=torch.float32, device=device) * max_scale + 1e-4)
-    s_w = (torch.rand(N, dtype=torch.float32, device=device) * max_scale + 1e-4)
-    return x_int8, w_int8, s_a, s_w
 
 
 # ============================================================================
@@ -366,7 +351,7 @@ class TestInt8GemmInt8Out:
     ])
     def test_output_shape_and_dtype(self, M, N, K):
         """Output should be [M, N] int8 and [M] float32 scale."""
-        x_int8, w_int8, s_a, s_w = _make_int8_inputs(M, N, K, "cuda")
+        x_int8, w_int8, s_a, s_w = make_int8_inputs(M, N, K, "cuda")
         c, s_c = int8_gemm_int8out(x_int8, w_int8, s_w, s_a)
         assert c.shape == (M, N)
         assert c.dtype == torch.int8
@@ -394,7 +379,7 @@ class TestInt8GemmInt8Out:
         across columns, which is the common case in transformers).
         """
         torch.manual_seed(0)
-        x_int8, w_int8, s_a, s_w = _make_int8_inputs(M, N, K, "cuda")
+        x_int8, w_int8, s_a, s_w = make_int8_inputs(M, N, K, "cuda")
 
         c, s_c = int8_gemm_int8out(x_int8, w_int8, s_w, s_a)
 
@@ -422,7 +407,7 @@ class TestInt8GemmInt8Out:
     def test_preallocated_buffers_cuda(self):
         """Pre-allocated c_out and s_c_out should be used in-place."""
         M, N, K = 16, 512, 512
-        x_int8, w_int8, s_a, s_w = _make_int8_inputs(M, N, K, "cuda")
+        x_int8, w_int8, s_a, s_w = make_int8_inputs(M, N, K, "cuda")
 
         c_buf = torch.empty(M, N, dtype=torch.int8, device="cuda")
         s_buf = torch.empty(M, dtype=torch.float32, device="cuda")
@@ -441,8 +426,8 @@ class TestInt8GemmInt8Out:
         """
         torch.manual_seed(0)
         M, N, K = 16, 512, 512
-        x1, w1, s_a1, s_w1 = _make_int8_inputs(M, N, K, "cuda")
-        _, w2, _, s_w2 = _make_int8_inputs(M, N, N, "cuda")
+        x1, w1, s_a1, s_w1 = make_int8_inputs(M, N, K, "cuda")
+        _, w2, _, s_w2 = make_int8_inputs(M, N, N, "cuda")
 
         # First GEMM: int8 → int8
         c1, s_c1 = int8_gemm_int8out(x1, w1, s_w1, s_a1)
@@ -466,7 +451,7 @@ class TestInt8GemmInt8Out:
         """
         torch.manual_seed(0)
         M, N, K = 16, 1024, 1024
-        x_int8, w_int8, s_a, s_w = _make_int8_inputs(M, N, K, "cuda")
+        x_int8, w_int8, s_a, s_w = make_int8_inputs(M, N, K, "cuda")
 
         # Two-step: GEMM fp16 output → quantize
         out_f16 = fused_int8_gemm_dequant(x_int8, w_int8, s_w, s_a,
@@ -541,7 +526,7 @@ class TestExtendedAutotuning:
         """fused_int8_gemm_dequant should still produce correct results
         with the extended autotuning configs (num_stages=5,6)."""
         torch.manual_seed(0)
-        x_int8, w_int8, s_a, s_w = _make_int8_inputs(M, N, K, "cuda")
+        x_int8, w_int8, s_a, s_w = make_int8_inputs(M, N, K, "cuda")
 
         out = fused_int8_gemm_dequant(x_int8, w_int8, s_w, s_a,
                                        out_dtype=torch.float16)

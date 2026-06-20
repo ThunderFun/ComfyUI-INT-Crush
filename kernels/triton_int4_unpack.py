@@ -16,6 +16,9 @@ try:
 except ImportError:
     _HAS_TRITON = False
 
+# Largest K-tile for the unpack kernel — matches the GEMM autotune BLOCK_K.
+_DEFAULT_BLOCK_K: int = 2048
+
 
 if _HAS_TRITON:
 
@@ -70,7 +73,7 @@ def unpack_int4_to_float16(packed: torch.Tensor, scale: torch.Tensor, K: int) ->
     N = packed.shape[0]
     out = torch.empty(N, K, dtype=torch.float16, device=packed.device)
 
-    BLOCK_K = 2048
+    BLOCK_K = _DEFAULT_BLOCK_K
     grid = (N, triton.cdiv(K, BLOCK_K))
 
     _unpack_int4_scaled_kernel[grid](
@@ -81,3 +84,6 @@ def unpack_int4_to_float16(packed: torch.Tensor, scale: torch.Tensor, K: int) ->
     )
 
     return out
+
+
+__all__ = ["unpack_int4_to_float16"]

@@ -7,6 +7,8 @@ node mappings for the ComfyUI graph.
 
 import logging
 
+log = logging.getLogger(__name__)
+
 try:
     from .convlinear import ConvLinear4bit
     __all__ = ["ConvLinear4bit"]
@@ -18,12 +20,12 @@ except ImportError:
 try:
     from .quant_layout import register_intcrush_layouts
     register_intcrush_layouts()
-except Exception as e:
-    logging.warning(f"INT-Crush: layout registration failed: {e}")
+except Exception:
+    log.warning("INT-Crush: layout registration failed", exc_info=True)
 
 # Expose ComfyUI node mappings so the host can discover loader nodes.
 try:
     from .comfy_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
     __all__ += ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-except (ImportError, RuntimeError):  # noqa: BLE001
-    pass
+except Exception:
+    log.warning("INT-Crush: node import failed", exc_info=True)

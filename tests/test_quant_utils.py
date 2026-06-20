@@ -1,11 +1,11 @@
-"""Tests for loader._quant_utils — loader-local quantization utilities."""
+"""Tests for _quant_utils — INT-Crush quantization utilities."""
 
-import importlib
 import math
 import torch
 import pytest
 
-_qu = importlib.import_module("ComfyUI-INT-Crush._quant_utils")
+from _intcrush import load as _load
+_qu = _load("_quant_utils")
 _is_power_of_four = _qu._is_power_of_four
 make_hadamard_regular = _qu.make_hadamard_regular
 pack_int4 = _qu.pack_int4

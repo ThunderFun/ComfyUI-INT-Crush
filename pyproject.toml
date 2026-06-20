@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ComfyUI-INT-Crush"
+version = "0.1.0"
+description = "INT4/INT8 quantized inference for ComfyUI diffusion models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["ComfyUI-INT-Crush*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+# conftest.py handles the hyphenated-package-name sys.modules injection.
+# When running from the project root: python -m pytest
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",   # line length (handled by formatter)
+    "B008",   # function call in default argument (used by ComfyUI patterns)
+    "SIM108", # ternary operator (readability preference)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Import probes in layout classes (try/except imports that intentionally discard names).
+"quant_layout.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ComfyUI-INT-Crush"]

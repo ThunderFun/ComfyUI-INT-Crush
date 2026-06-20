@@ -16,7 +16,10 @@ import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-from ._quant_utils import unpack_int4, INT4_SCALE_DIVISOR
+from ._quant_utils import unpack_int4, INT4_SCALE_DIVISOR, INT4_MIN, INT4_MAX, INT4_TWOS_COMPLEMENT_BIAS
+from ._quant_utils import INT8_MIN, INT8_MAX, INT8_SCALE_DIVISOR
+
+__all__ = ["IntCrushInt4Layout", "IntCrushInt8Layout", "register_intcrush_layouts"]
 
 # BaseLayoutParams is required by QuantizedTensor.__tensor_flatten__ which
 # calls dataclasses.fields(self._params) to discover tensor sub-fields.
@@ -86,9 +89,9 @@ class IntCrushInt4Layout:
     @classmethod
     def supports_fast_matmul(cls):
         try:
-            from .kernels.triton_int8_gemm import fused_int8_gemm_dequant
-            from .kernels.triton_quantize import dynamic_quantize_activation
-            from .kernels.triton_int4_to_int8_unpack import unpack_int4_to_int8
+            from .kernels.triton_int8_gemm import fused_int8_gemm_dequant  # noqa: F401  -- probe-by-import
+            from .kernels.triton_quantize import dynamic_quantize_activation  # noqa: F401
+            from .kernels.triton_int4_to_int8_unpack import unpack_int4_to_int8  # noqa: F401
             return True
         except Exception:
             return False
@@ -109,13 +112,13 @@ class IntCrushInt4Layout:
             scales = torch.tensor([scale], dtype=torch.float16, device=tensor.device)
 
         w_scaled = tensor / scales.to(tensor.dtype)
-        int_rounded = w_scaled.round().clamp(-8, 7).to(torch.int8)
+        int_rounded = w_scaled.round().clamp(INT4_MIN, INT4_MAX).to(torch.int8)
         # Pack two INT4 values per byte (low nibble = even index).
         K = int_rounded.shape[-1]
         if K % 2 != 0:
             pad = torch.zeros(*int_rounded.shape[:-1], 1, dtype=torch.int8, device=int_rounded.device)
             int_rounded = torch.cat([int_rounded, pad], dim=-1)
-        q_i8 = torch.where(int_rounded < 0, 16 + int_rounded, int_rounded).to(torch.uint8)
+        q_i8 = torch.where(int_rounded < 0, INT4_TWOS_COMPLEMENT_BIAS + int_rounded, int_rounded).to(torch.uint8)
         packed = q_i8[..., 0::2] | (q_i8[..., 1::2] << 4)
 
         orig_dtype = tensor.dtype
@@ -160,8 +163,8 @@ class IntCrushInt8Layout:
     @classmethod
     def supports_fast_matmul(cls):
         try:
-            from .kernels.triton_int8_gemm import fused_int8_gemm_dequant
-            from .kernels.triton_quantize import dynamic_quantize_activation
+            from .kernels.triton_int8_gemm import fused_int8_gemm_dequant  # noqa: F401  -- probe-by-import
+            from .kernels.triton_quantize import dynamic_quantize_activation  # noqa: F401
             return True
         except Exception:
             return False
@@ -175,14 +178,14 @@ class IntCrushInt8Layout:
         """
         max_vals = tensor.abs().amax(dim=1, keepdim=True)
         if scale is None or (isinstance(scale, str) and scale == "recalculate"):
-            scales = (max_vals / 127.0).clamp(min=1e-8).to(torch.float32)
+            scales = (max_vals / INT8_SCALE_DIVISOR).clamp(min=1e-8).to(torch.float32)
         elif isinstance(scale, torch.Tensor):
             scales = scale.to(torch.float32)
         else:
             scales = torch.tensor([scale], dtype=torch.float32, device=tensor.device)
 
         w_scaled = tensor / scales.to(tensor.dtype)
-        int_rounded = w_scaled.round().clamp(-128, 127).to(torch.int8)
+        int_rounded = w_scaled.round().clamp(INT8_MIN, INT8_MAX).to(torch.int8)
 
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
