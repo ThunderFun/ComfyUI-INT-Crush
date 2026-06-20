@@ -157,6 +157,31 @@ def _make_intcrush_ops(quant_format, rot_size):
                 self._intcrush_L2 = None
                 self.quant_format = None
                 self.layout_type = None
+                # ── INT-Crush LoRA residual buffers ──
+                self._intcrush_lora_down = None
+                self._intcrush_lora_up = None
+                self._intcrush_lora_scale = None
+
+            def _intcrush_lora_apply(self, x_2d, out):
+                """Apply LoRA residual via fused addmm_.
+
+                Computes ``out += scale * (x @ down.T) @ up.T`` with an
+                intermediate of shape [N, rank] only — no full [N, out]
+                temporary is allocated.
+                """
+                if self._intcrush_lora_down is None:
+                    return out
+                down = self._intcrush_lora_down
+                up = self._intcrush_lora_up
+                if down.device != x_2d.device:
+                    self._intcrush_lora_down = down.to(device=x_2d.device, dtype=x_2d.dtype)
+                    self._intcrush_lora_up = up.to(device=x_2d.device, dtype=x_2d.dtype)
+                    down = self._intcrush_lora_down
+                    up = self._intcrush_lora_up
+                scale = self._intcrush_lora_scale
+                mid = F.linear(x_2d, down)                      # [N, rank]
+                out.addmm_(mid, up.t(), beta=1, alpha=scale)    # fused into out
+                return out
 
             def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                                       strict, missing_keys, unexpected_keys, error_msgs):
@@ -402,6 +427,8 @@ def _make_intcrush_ops(quant_format, rot_size):
                         x_raw = x.reshape(-1, x.shape[-1])
                         lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
                         out = out + lr_out.to(out.dtype)
+                    # ── INT-Crush LoRA residual (unrotated space) ──
+                    out = self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
                     return finish(out)
 
                 qdata = weight._qdata
@@ -451,6 +478,9 @@ def _make_intcrush_ops(quant_format, rot_size):
                             lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
                             out = out + lr_out.to(out.dtype)
 
+                        # ── INT-Crush LoRA residual (unrotated space) ──
+                        self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
+
                         return finish(out)
 
                     # Path 2: W4A16 — Triton unpack to float16, then cuBLAS GEMM.
@@ -482,6 +512,9 @@ def _make_intcrush_ops(quant_format, rot_size):
                             lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
                             out = out + lr_out.to(out.dtype)
 
+                        # ── INT-Crush LoRA residual (unrotated space) ──
+                        self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
+
                         return finish(out)
 
                     # Path 3: PyTorch fallback — full dequant to float, then F.linear.
@@ -501,6 +534,8 @@ def _make_intcrush_ops(quant_format, rot_size):
                         x_raw = x.reshape(-1, x.shape[-1])
                         lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
                         out = out + lr_out.to(out.dtype)
+                    # ── INT-Crush LoRA residual (unrotated space) ──
+                    out = self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
                     return finish(out)
 
                 # ── INT8 forward paths ──
@@ -548,12 +583,15 @@ def _make_intcrush_ops(quant_format, rot_size):
                             bias=bias, out_dtype=compute_dtype,
                         )
 
-                    if has_svd:
-                        x_raw = x.reshape(-1, x.shape[-1])
-                        lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
-                        out = out + lr_out.to(out.dtype)
+                        if has_svd:
+                            x_raw = x.reshape(-1, x.shape[-1])
+                            lr_out = x_raw.to(svd_L1.dtype) @ svd_L2.T @ svd_L1.T
+                            out = out + lr_out.to(out.dtype)
 
-                    return finish(out)
+                        # ── INT-Crush LoRA residual (unrotated space) ──
+                        self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
+
+                        return finish(out)
 
                 # Unknown layout — delegate to standard manual_cast forward.
                 return super().forward(x)
@@ -624,7 +662,7 @@ class SimpleINT4UNetLoader:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
-    CATEGORY = "loaders"
+    CATEGORY = "loaders/INT-Crush"
 
     def load(self, unet_name: str, model_type: str, rot_size: int) -> tuple[object]:
         import folder_paths
@@ -674,7 +712,7 @@ class SimpleINT8UNetLoader:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
-    CATEGORY = "loaders"
+    CATEGORY = "loaders/INT-Crush"
 
     def load(self, unet_name: str, model_type: str, rot_size: int) -> tuple[object]:
         import folder_paths
@@ -731,14 +769,166 @@ class SimpleINT8UNetLoader:
         return (model,)
 
 
+# ── INT-Crush LoRA loader ────────────────────────────────────────────────────
+
+def _clear_intcrush_lora(model):
+    """Remove LoRA buffers from all IntCrushOps.Linear modules in a model."""
+    count = 0
+    for module in model.model.modules():
+        if hasattr(module, '_intcrush_lora_down'):
+            module._intcrush_lora_down = None
+            module._intcrush_lora_up = None
+            module._intcrush_lora_scale = None
+            count += 1
+    return count
+
+
+def _attach_lora_as_buffers(model, lora_sd, strength):
+    """Use ComfyUI's LoRA parsing to extract A/B matrices and attach as
+    residual buffers on IntCrushOps.Linear modules.
+
+    Returns (attached_count, total_patches).
+    """
+    import comfy.lora
+    import comfy.lora_convert
+    import comfy.weight_adapter
+
+    lora_sd = comfy.lora_convert.convert_lora(lora_sd)
+
+    key_map = comfy.lora.model_lora_keys_unet(model.model, {})
+    patches = comfy.lora.load_lora(lora_sd, key_map)
+
+    if not patches:
+        return 0, 0
+
+    _clear_intcrush_lora(model)
+
+    weight_key_to_module = {}
+    for name, module in model.model.named_modules():
+        if hasattr(module, '_intcrush_lora_down'):
+            weight_key_to_module[f"{name}.weight"] = module
+
+    attached = 0
+    for weight_key, patch in patches.items():
+        module = weight_key_to_module.get(weight_key)
+        if module is None:
+            continue
+
+        if not isinstance(patch, comfy.weight_adapter.WeightAdapterBase):
+            continue
+
+        mat_up, mat_down = patch.weights[0], patch.weights[1]
+        alpha = patch.weights[2]
+        mid = patch.weights[3]
+
+        if mid is not None:
+            continue  # Conv LoRA (tucker) not supported yet
+
+        if mat_down.dim() > 2:
+            mat_down = mat_down.reshape(mat_down.shape[0], -1)
+        if mat_up.dim() > 2:
+            mat_up = mat_up.reshape(mat_up.shape[0], -1)
+
+        rank = mat_down.shape[0]
+        if alpha is not None and rank > 0:
+            scale = strength * (float(alpha) / rank)
+        else:
+            scale = strength
+
+        # Store low-rank matrices on CPU; they are moved to GPU on first forward.
+        module._intcrush_lora_down = mat_down.to(dtype=torch.float16)
+        module._intcrush_lora_up = mat_up.to(dtype=torch.float16)
+        module._intcrush_lora_scale = scale
+        attached += 1
+
+    return attached, len(patches)
+
+
+class IntCrushLoRALoader:
+    """Load a LoRA file and attach it as a residual on the raw (unrotated)
+    activation, preserving ConvRot/SmoothRot quantization and the fast
+    Triton INT4/INT8 GEMM kernel paths.
+
+    Standard ComfyUI LoRA patching adds ΔW to the *rotated* weight matrix,
+    which corrupts the LoRA contribution. This node instead stores the LoRA
+    as separate low-rank buffers (down-projection A, up-projection B) and
+    applies ``out += (x_raw @ Aᵀ) @ Bᵀ * scale`` in the forward pass,
+    *before* any rotation or smoothing. This is mathematically equivalent
+    to the true unrotated LoRA and keeps the main weight as a
+    QuantizedTensor so the Triton kernels stay active.
+
+    Usage: connect MODEL output from an INT4/INT8 loader into this node,
+    then connect the output to KSampler (or wherever the model is used).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "The name of the LoRA."}),
+                "strength": ("FLOAT", {
+                    "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "loaders/INT-Crush"
+
+    def load(self, model, lora_name, strength):
+        import folder_paths
+        import comfy.utils
+
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora_sd, _metadata = comfy.utils.load_torch_file(
+            lora_path, safe_load=True, return_metadata=True)
+
+        if not lora_sd:
+            raise ValueError(f"INT-Crush LoRA: empty file '{lora_name}'")
+
+        attached, total = _attach_lora_as_buffers(model, lora_sd, strength)
+
+        if attached == 0:
+            print(f"[INT-Crush LoRA] WARNING: no modules matched "
+                  f"({total} patches parsed but none mapped to INT-Crush layers)")
+        else:
+            print(f"[INT-Crush LoRA] Attached to {attached} layer(s)")
+
+        return (model,)
+
+
+class IntCrushLoRAUnloader:
+    """Remove INT-Crush LoRA residual buffers from a model."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "unload"
+    CATEGORY = "loaders/INT-Crush"
+
+    def unload(self, model):
+        n = _clear_intcrush_lora(model)
+        print(f"[INT-Crush LoRA] Cleared LoRA from {n} layer(s)")
+        return (model,)
+
+
 # ── Node registration ────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
     "SimpleINT4UNetLoader": SimpleINT4UNetLoader,
     "SimpleINT8UNetLoader": SimpleINT8UNetLoader,
+    "IntCrushLoRALoader": IntCrushLoRALoader,
+    "IntCrushLoRAUnloader": IntCrushLoRAUnloader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SimpleINT4UNetLoader": "INT4 UNet Loader (INT-Crush)",
     "SimpleINT8UNetLoader": "INT8 UNet Loader (INT-Crush)",
+    "IntCrushLoRALoader": "LoRA Loader (INT-Crush)",
+    "IntCrushLoRAUnloader": "LoRA Unloader (INT-Crush)",
 }
