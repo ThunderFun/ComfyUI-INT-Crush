@@ -22,6 +22,13 @@ _configs_gemm = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=4, num_warps=8),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=3, num_warps=4),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=4, num_warps=8),
+    # num_stages=5,6 configs — marginal at small M, help at large K (≤13%).
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=5, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=6, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=5, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=6, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=5, num_warps=8),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=6, num_warps=8),
 ]
 
 
@@ -355,3 +362,152 @@ def fused_quant_int8_gemm_dequant(
     )
 
     return c
+
+
+# ── INT8-output GEMM (for chained GEMMs) ─────────────────────────────────────
+#
+# Outputs INT8 + per-row scale instead of fp16/bf16.  When two GEMMs are
+# chained (GEMM → activation → GEMM), the intermediate dequant+requant
+# round-trip through global memory can be skipped.  The downstream GEMM
+# consumes the returned s_c directly as its activation scale (s_a).
+#
+# Only valid between GEMMs that don't cross a norm layer boundary.
+
+
+_configs_int8out = _configs_gemm  # reuse the main GEMM autotuning configs
+
+
+@triton.autotune(configs=_configs_int8out, key=["M", "N", "K"])
+@triton.jit
+def _int8_gemm_int8out_kernel(
+    a_ptr, b_ptr, c_ptr, s_c_ptr,
+    s_a_ptr, s_w_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """INT8 GEMM with INT8 + per-row scale output (no fp16 dequant).
+
+    After the INT32 GEMM and dequant to fp32, the result is re-quantized
+    to INT8 with a fresh per-row scale (s_c) before storage, avoiding the
+    fp32 → fp16 → quantize round-trip that the two-step path requires.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0)
+        acc += tl.dot(a, b, allow_tf32=False)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Dequant accumulator to fp32 (s_a and s_w already have 1/127 absorbed).
+    s_a = tl.load(s_a_ptr + offs_m, mask=offs_m < M, other=1.0)
+    s_w = tl.load(s_w_ptr + offs_n, mask=offs_n < N, other=1.0)
+    out_f32 = acc.to(tl.float32) * (s_a[:, None] * s_w[None, :])
+
+    # Compute per-row abs-max of the fp32 output for the new int8 scale.
+    abs_out = tl.abs(out_f32)
+    row_max = tl.max(abs_out, axis=1)
+    row_max = tl.maximum(row_max, 1e-8)
+    scale_out = row_max / 127.0  # [BLOCK_M]
+
+    # Store per-row output scale (only for valid rows).
+    tl.store(s_c_ptr + offs_m, scale_out, mask=offs_m < M)
+
+    # Quantize the dequantized output to int8 and store.
+    quantized = out_f32 / scale_out[:, None]
+    rounded = tl.where(quantized >= 0, quantized + 0.5, quantized - 0.5)
+    clamped = tl.minimum(tl.maximum(rounded.to(tl.int32), -128), 127)
+
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, clamped.to(tl.int8), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def int8_gemm_int8out(
+    x_int8: torch.Tensor,
+    w_int8: torch.Tensor,
+    s_w: torch.Tensor,
+    s_a: torch.Tensor,
+    c_out: torch.Tensor | None = None,
+    s_c_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """INT8 GEMM that re-quantizes its output to INT8 (for chained GEMMs).
+
+    Equivalent to ``fused_int8_gemm_dequant`` followed by
+    ``dynamic_quantize_activation``, but avoids the fp32 round-trip.
+    The returned ``s_c`` can be passed directly as ``s_a`` to a
+    downstream ``fused_int8_gemm_dequant`` call.
+
+    Parameters
+    ----------
+    x_int8 : [M, K] int8 activations
+    w_int8 : [N, K] int8 weights
+    s_w    : [N] per-channel weight scales (1/127 already absorbed)
+    s_a    : [M] per-token activation scales (1/127 already absorbed)
+    c_out  : optional pre-allocated [M, N] int8 output buffer
+    s_c_out: optional pre-allocated [M] float32 output scale buffer
+
+    Returns
+    -------
+    c  : [M, N] int8 quantized output
+    s_c: [M]    float32 per-row output scales
+    """
+    assert x_int8.dtype == torch.int8, f"x_int8 must be int8, got {x_int8.dtype}"
+    assert w_int8.dtype == torch.int8, f"w_int8 must be int8, got {w_int8.dtype}"
+
+    M, K = x_int8.shape
+    N, K_w = w_int8.shape
+    assert K == K_w, f"K mismatch: {K} vs {K_w}"
+
+    if c_out is not None:
+        assert c_out.shape == (M, N), f"c_out shape mismatch: {c_out.shape} vs ({M}, {N})"
+        assert c_out.dtype == torch.int8, f"c_out must be int8, got {c_out.dtype}"
+        c = c_out
+    else:
+        c = torch.empty((M, N), dtype=torch.int8, device=x_int8.device)
+
+    if s_c_out is not None:
+        assert s_c_out.shape == (M,), f"s_c_out shape mismatch: {s_c_out.shape} vs ({M},)"
+        assert s_c_out.dtype == torch.float32, f"s_c_out must be float32, got {s_c_out.dtype}"
+        s_c = s_c_out
+    else:
+        s_c = torch.empty(M, dtype=torch.float32, device=x_int8.device)
+
+    GROUP_M = 8
+
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
+    _int8_gemm_int8out_kernel[grid](
+        x_int8, w_int8, c, s_c,
+        s_a, s_w,
+        M, N, K,
+        x_int8.stride(0), x_int8.stride(1),
+        w_int8.stride(1), w_int8.stride(0),
+        c.stride(0), c.stride(1),
+        GROUP_M=GROUP_M,
+    )
+
+    return c, s_c

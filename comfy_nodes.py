@@ -537,15 +537,11 @@ def _make_intcrush_ops(quant_format, rot_size):
                         w_scale_2d = w_scale.reshape(-1, 1) if w_scale.ndim == 1 else w_scale
                         w_float = qdata.to(compute_dtype) * w_scale_2d.to(compute_dtype)
                         out = F.linear(x_2d, w_float, bias)
-                    elif (batch <= 32 or (batch <= 128 and x_2d.shape[1] <= 4096)
-                          ) and _HAS_FUSED_QUANT_GEMM and _TRITON_DYNQUANT:
-                        # Medium batch: fused quantize+GEMM+dequant in a single kernel.
-                        out = fused_quant_int8_gemm_dequant(
-                            x_2d, qdata, w_scale,
-                            bias=bias, out_dtype=compute_dtype,
-                        )
                     else:
-                        # Large batch: separate dynamic quantize + fused INT8 GEMM.
+                        # Two-kernel path (quantize → GEMM) is always faster than
+                        # the fused quant+GEMM kernel for batch > 16: the fused kernel
+                        # reads fp16 twice (abs-max pass + quantize pass), while this
+                        # path reads fp16 once, then int8 on the GEMM (half bandwidth).
                         x_int8, s_a = dynamic_quantize_activation(x_2d)
                         out = fused_int8_gemm_dequant(
                             x_int8, qdata, w_scale, s_a,
