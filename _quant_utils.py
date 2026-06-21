@@ -122,7 +122,7 @@ def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = 
     (powers of 4) with Sylvester fallback for other power-of-2 sizes.
     """
     if not _is_power_of_two(rot_size):
-        raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
+        raise ValueError(f"rot_size must be power of 2, got {rot_size}")
 
     orig_features = x.shape[-1]
     if orig_features % rot_size != 0:

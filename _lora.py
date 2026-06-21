@@ -1,34 +1,47 @@
-"""INT-Crush LoRA residual buffer management.
+"""INT-Crush adapter residual management.
 
-Provides helpers to attach/detach LoRA adapters as low-rank residual
-buffers on IntCrushOps.Linear modules.  This avoids corrupting the
-quantized weight by applying the LoRA in *unrotated* activation space.
+Provides helpers to attach/detach weight adapters (LoRA, LoKr, LoHa,
+OFT, BOFT, GLoRA) as residual buffers on IntCrushOps.Linear modules.
+The adapter's ``h(x, out)`` computes the additive delta and ``g(out)``
+applies any output transformation (identity for most; orthogonal
+rotation for OFT/BOFT).
+
+All six adapter types supported by ComfyUI's weight_adapter system
+work out of the box — the adapter's own math is used directly.
 """
 
+import logging
 import torch
 from typing import Any
 
 __all__ = ["clear_intcrush_lora", "attach_lora_as_buffers"]
 
+_log = logging.getLogger(__name__)
+
 
 def clear_intcrush_lora(model: Any) -> int:
-    """Remove LoRA buffers from all IntCrushOps.Linear modules in a model."""
+    """Remove adapter residuals from all IntCrushOps.Linear modules."""
     count = 0
     for module in model.model.modules():
-        if hasattr(module, '_intcrush_lora_down'):
-            module._intcrush_lora_down = None
-            module._intcrush_lora_up = None
-            module._intcrush_lora_scale = None
+        if hasattr(module, '_intcrush_adapter'):
+            module._intcrush_adapter = None
+            module._intcrush_lora_strength = None
+            module._intcrush_adapter_ready = False
+            module._intcrush_adapter_device = None
+            module._intcrush_lokr_cache = None
+            module._intcrush_lokr_cache_adapter_id = None
+            module._intcrush_lokr_cache_strength = None
             count += 1
     return count
 
 
 def attach_lora_as_buffers(model: Any, lora_sd: dict, strength: float) -> tuple[int, int]:
-    """Parse a LoRA state-dict and attach A/B matrices as residual buffers.
+    """Parse a LoRA state-dict and attach adapter objects as residual buffers.
 
-    Uses ComfyUI's LoRA parsing to extract up/down matrices, then stores
-    them as ``_intcrush_lora_down`` / ``_intcrush_lora_up`` on each
-    matching IntCrushOps.Linear module.
+    Uses ComfyUI's LoRA parsing to extract weight adapters, then stores
+    each adapter on its matching IntCrushOps.Linear module.  At forward
+    time the adapter's ``h(x, out)`` / ``g(out)`` methods are called
+    directly — no per-type matrix extraction needed.
 
     Returns (attached_count, total_patches).
     """
@@ -48,7 +61,7 @@ def attach_lora_as_buffers(model: Any, lora_sd: dict, strength: float) -> tuple[
 
     weight_key_to_module = {}
     for name, module in model.model.named_modules():
-        if hasattr(module, '_intcrush_lora_down'):
+        if hasattr(module, '_intcrush_adapter'):
             weight_key_to_module[f"{name}.weight"] = module
 
     attached = 0
@@ -60,29 +73,15 @@ def attach_lora_as_buffers(model: Any, lora_sd: dict, strength: float) -> tuple[
         if not isinstance(patch, comfy.weight_adapter.WeightAdapterBase):
             continue
 
-        # Weights layout: [0]=up, [1]=down, [2]=alpha, [3]=mid-decomposition
-        mat_up, mat_down = patch.weights[0], patch.weights[1]
-        alpha = patch.weights[2]
-        mid = patch.weights[3]
-
-        if mid is not None:
-            continue  # Conv LoRA (tucker) not supported yet
-
-        if mat_down.dim() > 2:
-            mat_down = mat_down.reshape(mat_down.shape[0], -1)
-        if mat_up.dim() > 2:
-            mat_up = mat_up.reshape(mat_up.shape[0], -1)
-
-        rank = mat_down.shape[0]
-        if alpha is not None and rank > 0:
-            scale = strength * (float(alpha) / rank)
-        else:
-            scale = strength
-
-        # Store low-rank matrices on CPU; they are moved to GPU on first forward.
-        module._intcrush_lora_down = mat_down.to(dtype=torch.float16)
-        module._intcrush_lora_up = mat_up.to(dtype=torch.float16)
-        module._intcrush_lora_scale = scale
+        # Store the adapter object — h()/g() handle the math for all types.
+        module._intcrush_adapter = patch
+        module._intcrush_lora_strength = strength
         attached += 1
+
+    if attached == 0:
+        _log.warning(
+            "[INT-Crush LoRA] No modules matched (%d patches parsed "
+            "but none mapped to INT-Crush layers)", len(patches),
+        )
 
     return attached, len(patches)

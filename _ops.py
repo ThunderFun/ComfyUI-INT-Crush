@@ -70,6 +70,71 @@ def _get_cast():
     return _cast_bias_weight, _uncast_bias_weight
 
 
+def _move_adapter_weights(adapter: Any, device: torch.device, dtype: torch.dtype) -> None:
+    """Move all tensor entries in ``adapter.weights`` to *device*/*dtype*.
+
+    Non-tensor entries (floats, None, lists) are left untouched.
+    """
+    moved: list[Any] = []
+    for w in adapter.weights:
+        if w is not None and isinstance(w, torch.Tensor):
+            moved.append(w.to(device=device, dtype=dtype))
+        else:
+            moved.append(w)
+    adapter.weights = tuple(moved)
+
+
+def _apply_lokr(
+    cache: dict[str, Any],
+    x_raw: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """In-place LoKr Kronecker accumulation — pre-combined factors.
+
+    The cache always contains ``w1`` (combined), ``w2_t`` (combined,
+    transposed, contiguous) and ``scale`` — no per-call factor
+    reconstruction.  Each chunk performs exactly two operations:
+
+    1. ``temp = w1 @ X``  (broadcasting matmul)
+    2. ``out += scale * (temp @ w2_t)``  (fused via ``addmm_``)
+
+    Chunk size adapts to available VRAM (up to 256 MB), minimising
+    total kernel launches.
+    """
+    w1 = cache["w1"]
+    w2_t = cache["w2_t"]
+    scale = cache["scale"]
+
+    N = x_raw.shape[0]
+    out_l, in_m = w1.shape
+    in_n, out_k = w2_t.shape
+
+    # ── Dynamic chunk sizing: use available VRAM (cap 256 MB) ─────────
+    el_sz = 2 if x_raw.dtype == torch.float16 else 4
+    bytes_per_token = out_l * (in_n + out_k) * el_sz
+    try:
+        free, _ = torch.cuda.mem_get_info(x_raw.device)
+        budget = min(free // 4, 256 * 1024 * 1024)
+    except Exception:
+        budget = 32 * 1024 * 1024
+    chunk = max(1, min(N, budget // max(bytes_per_token, 1)))
+
+    out_3d = out.view(N, out_l, out_k)
+    for s in range(0, N, chunk):
+        e = min(s + chunk, N)
+        X = x_raw[s:e].reshape(e - s, in_m, in_n)
+        temp = w1 @ X                   # [C, out_l, in_n]
+
+        # Fused: out_3d[s:e] += scale * (temp @ w2_t)
+        out_slice = out_3d[s:e].view(-1, out_k)
+        out_slice.addmm_(temp.view(-1, in_n), w2_t,
+                         beta=1.0, alpha=scale)
+        del temp, X, out_slice
+
+    del out_3d
+    return out
+
+
 # ── Ops factory ──────────────────────────────────────────────────────────────
 
 _ops_cache: dict[tuple, type] = {}
@@ -114,34 +179,153 @@ def make_intcrush_ops(
                 self._intcrush_w_in: int | None = None
                 self.quant_format: str | None = None
                 self.layout_type: str | None = None
-                # ── INT-Crush LoRA residual buffers ──
-                self._intcrush_lora_down: torch.Tensor | None = None
-                self._intcrush_lora_up: torch.Tensor | None = None
-                self._intcrush_lora_scale: float | None = None
+                # ── INT-Crush adapter (LoRA / LoKr / LoHa / OFT / BOFT) ──
+                self._intcrush_adapter: Any | None = None
+                self._intcrush_lora_strength: float | None = None
+                self._intcrush_adapter_ready: bool = False
+                self._intcrush_adapter_device: torch.device | None = None
+                self._intcrush_lokr_cache: dict | None = None
+                self._intcrush_lokr_cache_adapter_id: int | None = None
+                self._intcrush_lokr_cache_strength: float | None = None
 
-            def _intcrush_lora_apply(self, x_2d: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                """Apply LoRA residual via fused addmm_.
 
-                Computes ``out += scale * (x @ down.T) @ up.T`` with an
-                intermediate of shape [N, rank] only — no full [N, out]
-                temporary is allocated.
+            def _apply_adapter(self, x_raw: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                """Apply adapter residual.
+
+                Supports all ComfyUI adapter types (LoRA, LoKr, LoHa,
+                OFT, BOFT, GLoRA).
+
+                Standard LoRA uses the memory-efficient ``addmm_`` path
+                (only a ``[N, rank]`` intermediate).  LoKr uses a custom
+                in-place path that accumulates directly into *out* without
+                materialising the full delta.  All other adapter types go
+                through the adapter's own ``h()``/``g()`` methods.
+
+                Args:
+                    x_raw: 2-D input  ``[N, in_features]`` (unrotated).
+                    out:   2-D output ``[N, out_features]`` from quantised
+                           GEMM (+ optional SVD residual).
                 """
-                if self._intcrush_lora_down is None:
+                adapter = self._intcrush_adapter
+                if adapter is None:
                     return out
-                down = self._intcrush_lora_down
-                up = self._intcrush_lora_up
-                target_dtype = out.dtype
-                # Move/cast on device OR dtype mismatch.  Store in out.dtype
-                # so addmm_ doesn't need a temporary cast of mid/up.
-                if down.device != x_2d.device or down.dtype != target_dtype:
-                    self._intcrush_lora_down = down.to(device=x_2d.device, dtype=target_dtype)
-                    self._intcrush_lora_up = up.to(device=x_2d.device, dtype=target_dtype)
-                    down = self._intcrush_lora_down
-                    up = self._intcrush_lora_up
-                scale = self._intcrush_lora_scale
-                mid = F.linear(x_2d, down)                      # [N, rank]
-                out.addmm_(mid, up.t(), beta=1, alpha=scale)
-                return out
+
+                device = x_raw.device
+                dtype = x_raw.dtype
+
+                # Move adapter weight tensors to device/dtype on first
+                # use or when the module has been relocated.
+                if (not self._intcrush_adapter_ready
+                        or self._intcrush_adapter_device != device):
+                    _move_adapter_weights(adapter, device, dtype)
+                    self._intcrush_adapter_ready = True
+                    self._intcrush_adapter_device = device
+
+                strength = self._intcrush_lora_strength
+
+                # ── Standard LoRA: fast in-place addmm_ path ──────────
+                # Only allocates [N, rank] — never materialises the full
+                # [N, out_features] delta.  This is critical for VRAM.
+                if adapter.name == "lora":
+                    v = adapter.weights
+                    up, down, alpha = v[0], v[1], v[2]
+                    rank = down.shape[0]
+                    scale = ((float(alpha) / rank) if alpha is not None else 1.0)
+                    scale *= strength
+                    mid = F.linear(x_raw, down)           # [N, rank]
+                    out.addmm_(mid, up.t(), beta=1, alpha=scale)
+                    return out
+
+                # ── LoKr: in-place Kronecker accumulation ─────────────
+                # Avoids materialising the full [N, out] delta by
+                # accumulating directly into *out* via view + add_.
+                if adapter.name == "lokr":
+                    # Set up persistent cache for LoKR factors.
+                    adapter_changed = (
+                        id(adapter) != self._intcrush_lokr_cache_adapter_id
+                        or strength != self._intcrush_lokr_cache_strength
+                    )
+                    if adapter_changed:
+                        self._intcrush_lokr_cache = self._setup_lokr_cache(
+                            adapter, device, dtype, strength)
+                        self._intcrush_lokr_cache_adapter_id = id(adapter)
+                        self._intcrush_lokr_cache_strength = strength
+                    return _apply_lokr(self._intcrush_lokr_cache, x_raw, out)
+
+                # ── All other adapters: h() + g() (in-place add) ──────
+                adapter.multiplier = strength
+
+                # h() returns the additive residual (zeros for OFT/BOFT).
+                delta = adapter.h(x_raw, out)
+                out.add_(delta.to(out.dtype))
+
+                # g() returns the output transformation (identity for
+                # LoHa/GLoRA; orthogonal rotation for OFT/BOFT).
+                return adapter.g(out)
+
+            def _setup_lokr_cache(self, adapter: Any, device: torch.device,
+                                  dtype: torch.dtype, strength: float) -> dict:
+                """Build cached LoKR factors — always precompute combined w1 + w2_t.
+
+                Both decomposed and direct factors are resolved to a
+                uniform ``(w1, w2_t, scale)`` cache so that
+                ``_apply_lokr`` uses a single 2-matmul path.  The
+                combined factors are built *once* and reused across all
+                forward calls.
+                """
+                v = adapter.weights
+                w1, w2 = v[0], v[1]
+                alpha = v[2]
+                w1_a, w1_b = v[3], v[4]
+                w2_a, w2_b = v[5], v[6]
+                t2 = v[7]
+
+                cache: dict[str, Any] = {}
+
+                # ── Resolve w1 to a single [out_l, in_m] tensor ───────
+                if w1 is not None:
+                    cache["w1"] = w1.to(device=device, dtype=dtype)
+                else:
+                    cache["w1"] = (
+                        w1_a.to(device=device, dtype=dtype)
+                        @ w1_b.to(device=device, dtype=dtype)
+                    )
+
+                # ── Resolve w2 to a single [out_k, in_n] tensor ───────
+                if w2 is not None:
+                    w2_dev = w2.to(device=device, dtype=dtype)
+                elif t2 is not None:
+                    t2_d = t2.to(device=device, dtype=dtype)
+                    w2a_d = w2_a.to(device=device, dtype=dtype)
+                    w2b_d = w2_b.to(device=device, dtype=dtype)
+                    w2_dev = torch.einsum(
+                        "i j k l, j r, i p -> p r k l", t2_d, w2b_d, w2a_d,
+                    )
+                    del t2_d, w2a_d, w2b_d
+                else:
+                    w2_dev = (
+                        w2_a.to(device=device, dtype=dtype)
+                        @ w2_b.to(device=device, dtype=dtype)
+                    )
+
+                # Pre-transpose to contiguous [in_n, out_k] for matmul.
+                cache["w2_t"] = w2_dev.t().contiguous()
+                del w2_dev
+
+                # ── Compute and cache scale ───────────────────────────
+                if w1_a is not None:
+                    rank = w1_b.shape[0]
+                elif w2_a is not None:
+                    rank = w2_b.shape[0]
+                else:
+                    rank = None
+
+                if rank is not None and alpha is not None:
+                    cache["scale"] = (float(alpha) / rank) * strength
+                else:
+                    cache["scale"] = strength
+
+                return cache
 
             def _prep_activation(self, x: torch.Tensor, pad_to_w_in: bool = True, apply_perm: bool = True) -> torch.Tensor:
                 """Common activation prep: reshape → SmoothRot → Hadamard → pad → permute.
@@ -174,7 +358,7 @@ def make_intcrush_ops(
                 return x_2d
 
             def _apply_residuals(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                """Apply SVD low-rank residual and LoRA residual in unrotated space."""
+                """Apply SVD low-rank residual and standard adapter residual."""
                 svd_L1 = self._intcrush_L1
                 svd_L2 = self._intcrush_L2
                 if svd_L1 is not None and svd_L2 is not None:
@@ -191,13 +375,16 @@ def make_intcrush_ops(
                     mid = x_raw.to(svd_L1.dtype) @ svd_L2.T
                     out.addmm_(mid, svd_L1.T.to(out.dtype), beta=1, alpha=1)
 
-                self._intcrush_lora_apply(x.reshape(-1, x.shape[-1]), out)
+                self._apply_adapter(x.reshape(-1, x.shape[-1]), out)
                 return out
 
-            def _finish_forward(self, out: torch.Tensor, x: torch.Tensor, uncast: Callable[..., None] | None) -> torch.Tensor:
-                """Uncast weight, convert dtype, reshape to original input shape."""
-                if uncast is not None:
-                    uncast()
+            def _finish_forward(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+                """Convert dtype and reshape to original input shape.
+
+                Note: uncast (VBAR unpin) is handled by forward()'s
+                try/finally — not here — so that the pin is always
+                released even when _apply_residuals raises.
+                """
                 out = out.to(x.dtype)
                 return out.reshape(*x.shape[:-1], -1)
 
@@ -238,16 +425,15 @@ def make_intcrush_ops(
                 return weight, bias, uncast, QT
 
             def _forward_predequant(self, weight: torch.Tensor, bias: torch.Tensor | None,
-                                    x: torch.Tensor, uncast: Callable[..., None] | None) -> torch.Tensor:
+                                    x: torch.Tensor) -> torch.Tensor:
                 """Forward when weight is already dequantized (e.g. wrapper patch ran)."""
                 x_2d = self._prep_activation(x, pad_to_w_in=False, apply_perm=False)
                 out = F.linear(x_2d, weight, bias)
                 out = self._apply_residuals(x, out)
-                return self._finish_forward(out, x, uncast)
+                return self._finish_forward(out, x)
 
             def _forward_int4_w4a8(self, qdata: torch.Tensor, weight: Any,
-                                   bias: torch.Tensor | None, x: torch.Tensor,
-                                   uncast: Callable[..., None] | None) -> torch.Tensor:
+                                   bias: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor:
                 """INT4 Path 1: W4A8 — unpack INT4→INT8, dynamic-quantize activations,
                 fused INT8 GEMM + dequant (fastest when all Triton kernels available)."""
                 x_2d = self._prep_activation(x)
@@ -268,11 +454,10 @@ def make_intcrush_ops(
                     out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
 
                 out = self._apply_residuals(x, out)
-                return self._finish_forward(out, x, uncast)
+                return self._finish_forward(out, x)
 
             def _forward_int4_w4a16(self, qdata: torch.Tensor, weight: Any,
-                                    bias: torch.Tensor | None, x: torch.Tensor,
-                                    uncast: Callable[..., None] | None) -> torch.Tensor:
+                                    bias: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor:
                 """INT4 Path 2: W4A16 — Triton unpack to float16, then cuBLAS GEMM."""
                 x_2d = self._prep_activation(x)
                 scale_flat = weight._params.scale.reshape(-1).float().contiguous()
@@ -286,21 +471,20 @@ def make_intcrush_ops(
                     out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
 
                 out = self._apply_residuals(x, out)
-                return self._finish_forward(out, x, uncast)
+                return self._finish_forward(out, x)
 
             def _forward_int4_pytorch(self, qdata: torch.Tensor, weight: Any,
-                                      x: torch.Tensor, uncast: Callable[..., None] | None) -> torch.Tensor:
+                                      x: torch.Tensor) -> torch.Tensor:
                 """INT4 Path 3: PyTorch fallback — full dequant to float, then F.linear."""
                 w_float = IntCrushInt4Layout.dequantize(qdata, weight._params).to(x.device, x.dtype)
                 x_2d = self._prep_activation(x, pad_to_w_in=False)
                 out = F.linear(x_2d, w_float)
                 del x_2d, w_float
                 out = self._apply_residuals(x, out)
-                return self._finish_forward(out, x, uncast)
+                return self._finish_forward(out, x)
 
             def _forward_int8(self, qdata: torch.Tensor, weight: Any,
-                              bias: torch.Tensor | None, x: torch.Tensor,
-                              uncast: Callable[..., None] | None) -> torch.Tensor:
+                              bias: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor:
                 """INT8 forward: small-batch PyTorch fallback or Triton two-kernel path."""
                 w_scale = weight._params.scale
                 x_2d = self._prep_activation(x)
@@ -335,7 +519,7 @@ def make_intcrush_ops(
                     del x_int8
 
                 out = self._apply_residuals(x, out)
-                return self._finish_forward(out, x, uncast)
+                return self._finish_forward(out, x)
 
             # ── state-dict loading helpers ────────────────────────────────────
 
@@ -578,35 +762,42 @@ def make_intcrush_ops(
                 # ── ComfyUI weight casting (VBAR + low-VRAM) ──
                 weight, bias, uncast, QT = self._setup_casting(x)
 
-                # ── Weight already dequantized (e.g. wrapper patch ran) ──
-                if not isinstance(weight, QT):
-                    return self._forward_predequant(weight, bias, x, uncast)
+                # try/finally guarantees VBAR pages are always unpinned,
+                # even when _apply_residuals (LoRA) raises.
+                try:
+                    # ── Weight already dequantized (e.g. wrapper patch ran) ──
+                    if not isinstance(weight, QT):
+                        return self._forward_predequant(weight, bias, x)
 
-                qdata = weight._qdata
+                    qdata = weight._qdata
 
-                # ── INT4 forward paths ──
-                if isinstance(weight._params, IntCrushInt4Layout.Params):
-                    _have_w4a8_kernel = (
-                        (_tr.TRITON_W4A8_GEMM or _tr.TRITON_INT8_GEMM)
-                        and _tr.TRITON_DYNQUANT
-                        and _tr.TRITON_INT4_INT8_UNPACK
-                    )
-                    if (not self._intcrush_use_pytorch and not self._intcrush_use_w4a16
-                            and self._intcrush_rot_need
-                            and _have_w4a8_kernel):
-                        return self._forward_int4_w4a8(qdata, weight, bias, x, uncast)
+                    # ── INT4 forward paths ──
+                    if isinstance(weight._params, IntCrushInt4Layout.Params):
+                        _have_w4a8_kernel = (
+                            (_tr.TRITON_W4A8_GEMM or _tr.TRITON_INT8_GEMM)
+                            and _tr.TRITON_DYNQUANT
+                            and _tr.TRITON_INT4_INT8_UNPACK
+                        )
+                        if (not self._intcrush_use_pytorch and not self._intcrush_use_w4a16
+                                and self._intcrush_rot_need
+                                and _have_w4a8_kernel):
+                            return self._forward_int4_w4a8(qdata, weight, bias, x)
 
-                    if not self._intcrush_use_pytorch and _tr.TRITON_INT4_UNPACK:
-                        return self._forward_int4_w4a16(qdata, weight, bias, x, uncast)
+                        if not self._intcrush_use_pytorch and _tr.TRITON_INT4_UNPACK:
+                            return self._forward_int4_w4a16(qdata, weight, bias, x)
 
-                    return self._forward_int4_pytorch(qdata, weight, x, uncast)
+                        return self._forward_int4_pytorch(qdata, weight, x)
 
-                # ── INT8 forward paths ──
-                if isinstance(weight._params, IntCrushInt8Layout.Params):
-                    return self._forward_int8(qdata, weight, bias, x, uncast)
+                    # ── INT8 forward paths ──
+                    if isinstance(weight._params, IntCrushInt8Layout.Params):
+                        return self._forward_int8(qdata, weight, bias, x)
 
-                # Unknown layout — delegate to standard manual_cast forward.
-                return super().forward(x)
+                    # Unknown layout — delegate to standard manual_cast forward.
+                    return super().forward(x)
+
+                finally:
+                    if uncast is not None:
+                        uncast()
 
         class GroupNorm(manual_cast.GroupNorm):
             pass

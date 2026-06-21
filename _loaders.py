@@ -240,8 +240,10 @@ class IntCrushLoRALoader:
         if not lora_sd:
             raise ValueError(f"INT-Crush LoRA: empty file '{lora_name}'")
 
-        attached, total = attach_lora_as_buffers(model, lora_sd, strength)
+        metadata = _metadata or {}
 
+        # Standard LoRA: parse with ComfyUI's adapter system.
+        attached, total = attach_lora_as_buffers(model, lora_sd, strength)
         if attached == 0:
             log.warning("[INT-Crush LoRA] No modules matched (%d patches parsed but none mapped to INT-Crush layers)", total)
         else:
