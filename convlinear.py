@@ -132,9 +132,13 @@ class ConvLinear4bit(nn.Module):
         bias: torch.Tensor | None = None,
         rot_size: int = 256,
         perm: torch.Tensor | None = None,
+        in_features: int | None = None,
     ):
         super().__init__()
-        self.in_features = weight.shape[-1] * 2  # 2 INT4 values packed per byte
+        if in_features is not None:
+            self.in_features = in_features
+        else:
+            self.in_features = weight.shape[-1] * 2
         self.out_features = weight.shape[-2]
         self.rot_need = rot_need
         self.rot_size = rot_size
@@ -191,6 +195,7 @@ class ConvLinear4bit(nn.Module):
             bias=bias,
             rot_size=rot_size,
             perm=perm,
+            in_features=in_features,
         )
 
     def extra_repr(self) -> str:

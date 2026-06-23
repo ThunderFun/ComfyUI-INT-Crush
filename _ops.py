@@ -81,7 +81,7 @@ def _move_adapter_weights(adapter: Any, device: torch.device, dtype: torch.dtype
             moved.append(w.to(device=device, dtype=dtype))
         else:
             moved.append(w)
-    adapter.weights = tuple(moved)
+    adapter.weights = type(adapter.weights)(moved)
 
 
 def _apply_lokr(
@@ -119,6 +119,8 @@ def _apply_lokr(
         budget = 32 * 1024 * 1024
     chunk = max(1, min(N, budget // max(bytes_per_token, 1)))
 
+    if not out.is_contiguous():
+        out = out.contiguous()
     out_3d = out.view(N, out_l, out_k)
     for s in range(0, N, chunk):
         e = min(s + chunk, N)
@@ -126,7 +128,7 @@ def _apply_lokr(
         temp = w1 @ X                   # [C, out_l, in_n]
 
         # Fused: out_3d[s:e] += scale * (temp @ w2_t)
-        out_slice = out_3d[s:e].view(-1, out_k)
+        out_slice = out_3d[s:e].reshape(-1, out_k)
         out_slice.addmm_(temp.view(-1, in_n), w2_t,
                          beta=1.0, alpha=scale)
         del temp, X, out_slice
@@ -230,7 +232,7 @@ def make_intcrush_ops(
                     v = adapter.weights
                     up, down, alpha = v[0], v[1], v[2]
                     rank = down.shape[0]
-                    scale = ((float(alpha) / rank) if alpha is not None else 1.0)
+                    scale = ((float(alpha) / rank) if alpha else 1.0)
                     scale *= strength
                     mid = F.linear(x_raw, down)           # [N, rank]
                     out.addmm_(mid, up.t(), beta=1, alpha=scale)
@@ -278,7 +280,7 @@ def make_intcrush_ops(
                 alpha = v[2]
                 w1_a, w1_b = v[3], v[4]
                 w2_a, w2_b = v[5], v[6]
-                t2 = v[7]
+                t2 = v[7] if len(v) > 7 else None
 
                 cache: dict[str, Any] = {}
 
@@ -357,7 +359,8 @@ def make_intcrush_ops(
 
                 return x_2d
 
-            def _apply_residuals(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            def _apply_residuals(self, x: torch.Tensor, out: torch.Tensor,
+                                 x_prep: torch.Tensor | None = None) -> torch.Tensor:
                 """Apply SVD low-rank residual and standard adapter residual."""
                 svd_L1 = self._intcrush_L1
                 svd_L2 = self._intcrush_L2
@@ -365,14 +368,14 @@ def make_intcrush_ops(
                     # Rebind to self after device/dtype move so subsequent
                     # forwards reuse the cached tensor (avoids re-allocation
                     # when the model has been relocated to a different device).
-                    if svd_L1.device != x.device or svd_L1.dtype != torch.float16:
-                        svd_L1 = svd_L1.to(device=x.device, dtype=torch.float16)
+                    if svd_L1.device != x.device or svd_L1.dtype != x.dtype:
+                        svd_L1 = svd_L1.to(device=x.device, dtype=x.dtype)
                         self._intcrush_L1 = svd_L1
-                    if svd_L2.device != x.device or svd_L2.dtype != torch.float16:
-                        svd_L2 = svd_L2.to(device=x.device, dtype=torch.float16)
+                    if svd_L2.device != x.device or svd_L2.dtype != x.dtype:
+                        svd_L2 = svd_L2.to(device=x.device, dtype=x.dtype)
                         self._intcrush_L2 = svd_L2
-                    x_raw = x.reshape(-1, x.shape[-1])
-                    mid = x_raw.to(svd_L1.dtype) @ svd_L2.T
+                    svd_x = x_prep if x_prep is not None else x.reshape(-1, x.shape[-1])
+                    mid = svd_x.to(svd_L1.dtype) @ svd_L2.T
                     out.addmm_(mid, svd_L1.T.to(out.dtype), beta=1, alpha=1)
 
                 self._apply_adapter(x.reshape(-1, x.shape[-1]), out)
@@ -429,7 +432,7 @@ def make_intcrush_ops(
                 """Forward when weight is already dequantized (e.g. wrapper patch ran)."""
                 x_2d = self._prep_activation(x, pad_to_w_in=False, apply_perm=False)
                 out = F.linear(x_2d, weight, bias)
-                out = self._apply_residuals(x, out)
+                out = self._apply_residuals(x, out, x_prep=x_2d)
                 return self._finish_forward(out, x)
 
             def _forward_int4_w4a8(self, qdata: torch.Tensor, weight: Any,
@@ -440,7 +443,6 @@ def make_intcrush_ops(
                 x_int8, s_a = _tr.dynamic_quantize_activation(x_2d)
                 needs_zp = weight._params.zp is not None
                 x_2d_sum = x_2d.sum(dim=-1, keepdim=True) if needs_zp else None
-                del x_2d
                 w_int8 = _tr.unpack_int4_to_int8(qdata, self._intcrush_w_in)
                 scale_flat = weight._params.scale.reshape(-1).float().contiguous()
                 _gemm_fn = _tr.fused_w4a8_gemm_dequant if _tr.TRITON_W4A8_GEMM else _tr.fused_int8_gemm_dequant
@@ -453,7 +455,7 @@ def make_intcrush_ops(
                     zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(out.dtype)
                     out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
 
-                out = self._apply_residuals(x, out)
+                out = self._apply_residuals(x, out, x_prep=x_2d)
                 return self._finish_forward(out, x)
 
             def _forward_int4_w4a16(self, qdata: torch.Tensor, weight: Any,
@@ -465,28 +467,29 @@ def make_intcrush_ops(
                 x_2d_sum = x_2d.sum(dim=-1, keepdim=True) if needs_zp else None
                 weight_f16 = _tr.unpack_int4_to_float16(qdata, scale_flat, self._intcrush_w_in)
                 out = F.linear(x_2d, weight_f16)
-                del x_2d, weight_f16
+                del weight_f16
                 if needs_zp:
                     zp_cor = (scale_flat * weight._params.zp.reshape(-1).float()).to(out.dtype)
                     out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
 
-                out = self._apply_residuals(x, out)
+                out = self._apply_residuals(x, out, x_prep=x_2d)
                 return self._finish_forward(out, x)
 
             def _forward_int4_pytorch(self, qdata: torch.Tensor, weight: Any,
                                       x: torch.Tensor) -> torch.Tensor:
                 """INT4 Path 3: PyTorch fallback — full dequant to float, then F.linear."""
                 w_float = IntCrushInt4Layout.dequantize(qdata, weight._params).to(x.device, x.dtype)
-                x_2d = self._prep_activation(x, pad_to_w_in=False)
+                x_2d = self._prep_activation(x, pad_to_w_in=True)
                 out = F.linear(x_2d, w_float)
-                del x_2d, w_float
-                out = self._apply_residuals(x, out)
+                del w_float
+                out = self._apply_residuals(x, out, x_prep=x_2d)
                 return self._finish_forward(out, x)
 
             def _forward_int8(self, qdata: torch.Tensor, weight: Any,
                               bias: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor:
                 """INT8 forward: small-batch PyTorch fallback or Triton two-kernel path."""
                 w_scale = weight._params.scale
+                zp = weight._params.zp
                 x_2d = self._prep_activation(x)
 
                 # Old SmoothQuant: 1/s AFTER Hadamard (only for non-SmoothRot layers).
@@ -503,6 +506,9 @@ def make_intcrush_ops(
                 if batch <= 16 or not _tr.TRITON_AVAILABLE:
                     w_scale_2d = w_scale.reshape(-1, 1) if w_scale.ndim == 1 else w_scale
                     w_float = qdata.to(compute_dtype) * w_scale_2d.to(compute_dtype)
+                    if zp is not None:
+                        w_float = w_float - (zp.reshape(-1, 1).to(compute_dtype)
+                                             * w_scale_2d.to(compute_dtype))
                     out = F.linear(x_2d, w_float, bias)
                     del x_2d, w_float
                 else:
@@ -510,6 +516,8 @@ def make_intcrush_ops(
                     # the fused quant+GEMM kernel for batch > 16: the fused kernel
                     # reads fp16 twice (abs-max pass + quantize pass), while this
                     # path reads fp16 once, then int8 on the GEMM (half bandwidth).
+                    needs_zp = zp is not None
+                    x_2d_sum = x_2d.sum(dim=-1, keepdim=True) if needs_zp else None
                     x_int8, s_a = _tr.dynamic_quantize_activation(x_2d)
                     del x_2d
                     out = _tr.fused_int8_gemm_dequant(
@@ -517,6 +525,10 @@ def make_intcrush_ops(
                         bias=bias, out_dtype=compute_dtype,
                     )
                     del x_int8
+                    if needs_zp:
+                        scale_flat = w_scale.reshape(-1).float().contiguous()
+                        zp_cor = (scale_flat * zp.reshape(-1).float()).to(out.dtype)
+                        out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
 
                 out = self._apply_residuals(x, out)
                 return self._finish_forward(out, x)
@@ -671,6 +683,7 @@ def make_intcrush_ops(
                         rot_need=rot_need,
                         rot_size=rot_size,
                         perm=perm.to(device=device) if perm is not None else None,
+                        zp=zp.to(device=device) if zp is not None else None,
                     )
 
                 self._store_intcrush_attrs(tensors, params, device)
@@ -707,7 +720,7 @@ def make_intcrush_ops(
                 from comfy.quant_ops import QuantizedTensor
                 if self._intcrush_is_quantized and isinstance(weight, QuantizedTensor):
                     return weight
-                return weight
+                return super().convert_weight(weight, inplace)
 
             def set_weight(self, out_weight: torch.Tensor, inplace_update: bool = False, seed: int = 0,
                            return_weight: bool = False, **kwargs: Any) -> torch.Tensor | None:

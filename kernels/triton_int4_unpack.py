@@ -64,12 +64,14 @@ def unpack_int4_to_float16(packed: torch.Tensor, scale: torch.Tensor, K: int) ->
 
     Args:
         packed: [N, K_packed] uint8, 2 INT4 values per byte
-        scale:  [N] float16 per-row scales
+        scale:  [N] per-row scales (float16 or float32)
         K:      original (unpacked) feature dimension
 
     Returns:
         weight_f16: [N, K] float16 with scale applied
     """
+    if scale.dtype != torch.float16:
+        scale = scale.to(torch.float16)
     N = packed.shape[0]
     out = torch.empty(N, K, dtype=torch.float16, device=packed.device)
 

@@ -103,8 +103,8 @@ def _fused_int8_gemm_dequant_kernel(
         b_ptrs += BLOCK_K * stride_bk
 
     # --- Dequantisation ---
-    s_a = tl.load(s_a_ptr + offs_m, mask=offs_m < M, other=1.0)
-    s_w = tl.load(s_w_ptr + offs_n, mask=offs_n < N, other=1.0)
+    s_a = tl.load(s_a_ptr + offs_m, mask=offs_m < M, other=0.0)
+    s_w = tl.load(s_w_ptr + offs_n, mask=offs_n < N, other=0.0)
 
     acc_f32 = acc.to(tl.float32)
 
@@ -299,7 +299,7 @@ def _fused_quant_int8_gemm_dequant_kernel(
         b_ptrs += BLOCK_K * stride_bk
 
     # Phase 4: Dequant epilogue.
-    s_w = tl.load(s_w_ptr + offs_n, mask=n_mask, other=1.0)
+    s_w = tl.load(s_w_ptr + offs_n, mask=n_mask, other=0.0)
     acc_f32 = acc.to(tl.float32)
     scale = s_a[:, None] * s_w[None, :]
     acc_f32 = acc_f32 * scale
@@ -432,8 +432,8 @@ def _int8_gemm_int8out_kernel(
         b_ptrs += BLOCK_K * stride_bk
 
     # Dequant accumulator to fp32 (s_a and s_w already have 1/127 absorbed).
-    s_a = tl.load(s_a_ptr + offs_m, mask=offs_m < M, other=1.0)
-    s_w = tl.load(s_w_ptr + offs_n, mask=offs_n < N, other=1.0)
+    s_a = tl.load(s_a_ptr + offs_m, mask=offs_m < M, other=0.0)
+    s_w = tl.load(s_w_ptr + offs_n, mask=offs_n < N, other=0.0)
     out_f32 = acc.to(tl.float32) * (s_a[:, None] * s_w[None, :])
 
     # Compute per-row abs-max of the fp32 output for the new int8 scale.

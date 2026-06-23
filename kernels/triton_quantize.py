@@ -35,7 +35,7 @@ def _pick_block_k(K: int, max_block: int = _MAX_BLOCK_K) -> int:
     BLOCK_K = 1
     while BLOCK_K < min(K, max_block) and K % (BLOCK_K * 2) == 0:
         BLOCK_K *= 2
-    return BLOCK_K
+    return max(BLOCK_K, min(K, 32))
 
 
 # ── Shared Python helpers (CPU fallbacks and buffer management) ──────────────

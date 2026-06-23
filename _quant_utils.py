@@ -141,6 +141,7 @@ def rotate_activations(x: torch.Tensor, rot_size: int, H: torch.Tensor | None = 
             H = _make_hadamard_sylvester(rot_size, dtype=x.dtype, device=str(x.device))
     if H.device != x.device or H.dtype != x.dtype:
         H = H.to(dtype=x.dtype, device=x.device)
+        _H_cache[(rot_size, str(x.dtype), str(x.device))] = H
     x_rot = torch.matmul(x_flat, H.T)
 
     return x_rot.reshape(*leading_shape, in_features)

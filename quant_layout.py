@@ -137,11 +137,14 @@ class IntCrushInt8Layout:
         rot_need: bool = True
         rot_size: int = 256
         perm: torch.Tensor | None = None
+        zp: torch.Tensor | None = None
 
         def _tensor_fields(self) -> list[str]:
             fields = ["scale"]
             if self.perm is not None:
                 fields.append("perm")
+            if self.zp is not None:
+                fields.append("zp")
             return fields
 
         def _validate_tensor_fields(self):
@@ -153,11 +156,15 @@ class IntCrushInt8Layout:
         tensors = {"": qdata, "weight_scale": params.scale}
         if params.perm is not None:
             tensors["weight_perm"] = params.perm
+        if params.zp is not None:
+            tensors["weight_zp"] = params.zp
         return tensors
 
     @classmethod
     def dequantize(cls, qdata, params):
         """Full dequantization to float — used for LoRA patching and PyTorch fallback."""
+        if params.zp is not None:
+            return (qdata.float() - params.zp.reshape(-1, 1).float()) * params.scale.reshape(-1, 1).float()
         return qdata.float() * params.scale.reshape(-1, 1).float()
 
     @classmethod
@@ -200,21 +207,28 @@ def register_intcrush_layouts():
 
     Idempotent and safe to call even when comfy_kitchen is unavailable (no-op).
     """
+    import logging
+    _log = logging.getLogger(__name__)
+
     try:
         from comfy.quant_ops import register_layout_class, QUANT_ALGOS
+    except ImportError:
+        _log.warning("INT-Crush: comfy.quant_ops not available; layout registration skipped")
+        return
 
+    try:
         register_layout_class("IntCrushInt4Layout", IntCrushInt4Layout)
         register_layout_class("IntCrushInt8Layout", IntCrushInt8Layout)
+    except Exception:
+        _log.warning("INT-Crush: layout class registration failed", exc_info=True)
 
-        QUANT_ALGOS.setdefault("int4_crush", {
-            "storage_t": torch.uint8,
-            "parameters": {"weight_scale", "weight_zp", "weight_perm"},
-            "comfy_tensor_layout": "IntCrushInt4Layout",
-        })
-        QUANT_ALGOS.setdefault("int8_crush", {
-            "storage_t": torch.int8,
-            "parameters": {"weight_scale", "weight_perm"},
-            "comfy_tensor_layout": "IntCrushInt8Layout",
-        })
-    except ImportError:
-        pass
+    QUANT_ALGOS.setdefault("int4_crush", {
+        "storage_t": torch.uint8,
+        "parameters": {"weight_scale", "weight_zp", "weight_perm"},
+        "comfy_tensor_layout": "IntCrushInt4Layout",
+    })
+    QUANT_ALGOS.setdefault("int8_crush", {
+        "storage_t": torch.int8,
+        "parameters": {"weight_scale", "weight_perm", "weight_zp"},
+        "comfy_tensor_layout": "IntCrushInt8Layout",
+    })

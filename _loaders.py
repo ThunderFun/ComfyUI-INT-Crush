@@ -58,6 +58,12 @@ def _detect_rot_size(metadata: dict | None, default_rot_size: int, format_versio
                 return detected
         except (ValueError, TypeError):
             pass
+    log.warning(
+        "[INT-Crush] Metadata confirms INT-Crush format but rot_size is missing; "
+        "using default rot_size=%d. This may produce incorrect results if the "
+        "model was quantized with a different rot_size.",
+        default_rot_size,
+    )
     return default_rot_size
 
 
@@ -179,14 +185,40 @@ def _apply_padded_layer_fixes(model, padded_str: str) -> None:
             continue
 
         if hasattr(module, 'weight') and module.weight is not None:
-            padded_in = module.weight.shape[1]
-            if padded_in > orig_in:
-                module.weight = torch.nn.Parameter(
-                    module.weight[:, :orig_in].contiguous(),
-                    requires_grad=False,
-                )
-                log.info("[INT-Crush] INT8: Fixed %s in_features %d -> %d",
-                         layer_key, padded_in, orig_in)
+            weight = module.weight
+            if hasattr(weight, '_qdata'):
+                qdata = weight._qdata
+                params = weight._params
+                padded_in = qdata.shape[1] if qdata.dim() > 1 else qdata.shape[0]
+                if padded_in > orig_in:
+                    new_qdata = qdata[:, :orig_in].contiguous()
+                    new_params = type(params)(
+                        scale=params.scale,
+                        orig_dtype=params.orig_dtype,
+                        orig_shape=(params.orig_shape[0], orig_in),
+                        **{k: v for k, v in {
+                            'rot_need': getattr(params, 'rot_need', None),
+                            'rot_size': getattr(params, 'rot_size', None),
+                            'perm': getattr(params, 'perm', None),
+                            'zp': getattr(params, 'zp', None),
+                        }.items() if v is not None},
+                    )
+                    from comfy.quant_ops import QuantizedTensor
+                    module.weight = torch.nn.Parameter(
+                        QuantizedTensor(new_qdata, weight._layout_type, new_params),
+                        requires_grad=False,
+                    )
+                    log.info("[INT-Crush] INT8: Fixed %s in_features %d -> %d",
+                             layer_key, padded_in, orig_in)
+            else:
+                padded_in = weight.shape[1]
+                if padded_in > orig_in:
+                    module.weight = torch.nn.Parameter(
+                        weight[:, :orig_in].contiguous(),
+                        requires_grad=False,
+                    )
+                    log.info("[INT-Crush] INT8: Fixed %s in_features %d -> %d",
+                             layer_key, padded_in, orig_in)
 
         if module_path == "img_in" and hasattr(m, 'in_channels'):
             ps = getattr(m, 'patch_size', 1)

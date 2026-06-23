@@ -43,3 +43,26 @@ def make_int8_inputs(M: int, N: int, K: int, device: str = "cpu"):
     s_a = (torch.rand(M, dtype=torch.float32, device=device) * max_scale + 1e-4)
     s_w = (torch.rand(N, dtype=torch.float32, device=device) * max_scale + 1e-4)
     return x_int8, w_int8, s_a, s_w
+
+
+def make_int8_asymmetric_layer(N: int, K: int, device: str = "cpu"):
+    """Create asymmetric INT8 quantized weights: W = (q - zp) * scale.
+
+    Uses full-range asymmetric quantization where w_min maps to q=-128
+    and w_max maps to q=127, with a per-row zero-point offset.
+
+    Returns (q_int8, scale, zp) where:
+      - q_int8 is [N, K] int8 quantized weights
+      - scale  is [N] float32 per-row scales
+      - zp     is [N] float32 per-row zero-points (may be outside [-128, 127])
+    """
+    W = torch.randn(N, K, dtype=torch.float32, device=device)
+    w_min = W.amin(dim=1, keepdim=True)
+    w_max = W.amax(dim=1, keepdim=True)
+    # Asymmetric scale: range / 255 (full int8 range)
+    scale = ((w_max - w_min) / 255.0).clamp(min=1e-8).to(torch.float32)
+    # Zero-point: the quantized value that maps to float zero.
+    # w_min -> q=-128 => zp = -128 - w_min/scale
+    zp = (-128.0 - w_min / scale).round()
+    q = (W / scale + zp).round().clamp(-128, 127).to(torch.int8)
+    return q, scale.reshape(-1), zp.reshape(-1).to(torch.float32)

@@ -9,12 +9,13 @@ import logging
 
 log = logging.getLogger(__name__)
 
+__all__: list[str] = []
+
 try:
     from .convlinear import ConvLinear4bit
-    __all__ = ["ConvLinear4bit"]
+    __all__.append("ConvLinear4bit")
 except ImportError:
     ConvLinear4bit = None
-    __all__ = []
 
 # Register INT4/INT8 layout classes so QuantizedTensor can dispatch to them.
 try:
@@ -26,6 +27,6 @@ except Exception:
 # Expose ComfyUI node mappings so the host can discover loader nodes.
 try:
     from .comfy_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-    __all__ += ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+    __all__.extend(["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"])
 except Exception:
     log.warning("INT-Crush: node import failed", exc_info=True)
