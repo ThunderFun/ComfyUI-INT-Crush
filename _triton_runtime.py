@@ -19,11 +19,23 @@ TRITON_INT8_GEMM = False
 TRITON_INT4_INT8_UNPACK = False
 TRITON_DYNQUANT = False
 TRITON_W4A8_GEMM = False
+TRITON_FUSED_QGD = False
+
+# ── User toggles ─────────────────────────────────────────────────────────────
+# Set USE_FUSED_W8A8 = True to use the fused quantize+GEMM kernel for W8A8
+# inference instead of the default two-kernel path (quantize -> GEMM).
+USE_FUSED_W8A8: bool = False
+
+# Set USE_CUDA_GRAPHS = True to enable CUDA Graph capture for the INT8
+# two-kernel path. Eliminates launch overhead.
+# Requires PyTorch >= 2.0 and a CUDA-capable GPU.
+USE_CUDA_GRAPHS: bool = True
 
 # ── Kernel callables (None when unavailable) ────────────────────────────────
 
 dynamic_quantize_activation = None
 fused_int8_gemm_dequant = None
+fused_quant_int8_gemm_dequant = None
 fused_w4a8_gemm_dequant = None
 unpack_int4_to_int8 = None
 unpack_int4_to_float16 = None
@@ -37,11 +49,16 @@ _PROBES = [
     ("kernels.triton_quantize",      "dynamic_quantize_activation","TRITON_DYNQUANT"),
     ("kernels.triton_w4a8_gemm",     "fused_w4a8_gemm_dequant",   "TRITON_W4A8_GEMM"),
     ("kernels.triton_int8_gemm",     "fused_int8_gemm_dequant",   "TRITON_INT8_GEMM"),
+    ("kernels.triton_int8_gemm",     "fused_quant_int8_gemm_dequant", "TRITON_FUSED_QGD"),
     ("kernels.triton_int4_to_int8_unpack", "unpack_int4_to_int8", "TRITON_INT4_INT8_UNPACK"),
 ]
 
 import importlib as _importlib
+import os as _os
 import sys as _sys
+
+if _os.environ.get("INTCRUSH_NO_CUDA_GRAPHS", "0") == "1":
+    USE_CUDA_GRAPHS = False
 
 for _mod_path, _attr, _flag in _PROBES:
     try:
@@ -101,8 +118,12 @@ __all__ = [
     "TRITON_INT4_INT8_UNPACK",
     "TRITON_DYNQUANT",
     "TRITON_W4A8_GEMM",
+    "TRITON_FUSED_QGD",
+    "USE_FUSED_W8A8",
+    "USE_CUDA_GRAPHS",
     "dynamic_quantize_activation",
     "fused_int8_gemm_dequant",
+    "fused_quant_int8_gemm_dequant",
     "fused_w4a8_gemm_dequant",
     "unpack_int4_to_int8",
     "unpack_int4_to_float16",

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from ._quant_utils import rotate_activations
 from .quant_layout import IntCrushInt4Layout, IntCrushInt8Layout
 from . import _triton_runtime as _tr
+from ._cuda_graph import CudaGraphRunner
 
 _log = logging.getLogger(__name__)
 
@@ -211,6 +212,10 @@ def make_intcrush_ops(
                 adapter = self._intcrush_adapter
                 if adapter is None:
                     return out
+
+                # Invalidate CUDA graph cache on adapter changes.
+                if hasattr(self, '_graph_runner') and self._graph_runner is not None:
+                    self._graph_runner = None
 
                 device = x_raw.device
                 dtype = x_raw.dtype
@@ -490,6 +495,35 @@ def make_intcrush_ops(
                 """INT8 forward: small-batch PyTorch fallback or Triton two-kernel path."""
                 w_scale = weight._params.scale
                 zp = weight._params.zp
+
+                # Determine M and compute_dtype from raw x (before prep).
+                # prep_activation is a view-based reshape + CUDA ops, so M is
+                # the same before and after prep.
+                M = x.numel() // x.shape[-1]
+                compute_dtype = (x.dtype if x.dtype in (torch.float16, torch.bfloat16)
+                                 else torch.bfloat16)
+
+                # ── CUDA Graph path ──
+                # Requirements: Triton available, no zero-point,
+                #   no VBAR/casting (bias must be static), graphs enabled.
+                _can_graph = (
+                    _tr.TRITON_AVAILABLE
+                    and zp is None
+                    and not (self.comfy_cast_weights or self.weight_function
+                             or self.bias_function or self.weight_lowvram_function
+                             or self.bias_lowvram_function)
+                    and _tr.USE_CUDA_GRAPHS
+                )
+                if _can_graph:
+                    if not hasattr(self, '_graph_runner') or self._graph_runner is None:
+                        self._graph_runner = CudaGraphRunner(self, safe_no_clone=True)
+                    out = self._graph_runner.run(x, bias, compute_dtype)
+                    # _apply_residuals uses the raw x (not the prepped x_2d),
+                    # which is what the current code already does.
+                    out = self._apply_residuals(x, out)
+                    return self._finish_forward(out, x)
+
+                # ── Original paths (prep happens here) ──
                 x_2d = self._prep_activation(x)
 
                 # Old SmoothQuant: 1/s AFTER Hadamard (only for non-SmoothRot layers).
@@ -499,11 +533,9 @@ def make_intcrush_ops(
                         x_2d = x_2d / smooth.to(device=x_2d.device, dtype=x_2d.dtype)
 
                 batch = x_2d.shape[0]
-                compute_dtype = (x_2d.dtype if x_2d.dtype in (torch.float16, torch.bfloat16)
-                                 else torch.bfloat16)
 
-                # Small batch or no Triton: dequant weights to float and use F.linear.
-                if batch <= 16 or not _tr.TRITON_AVAILABLE:
+                # No Triton: dequant weights to float and use F.linear.
+                if not _tr.TRITON_AVAILABLE:
                     w_scale_2d = w_scale.reshape(-1, 1) if w_scale.ndim == 1 else w_scale
                     w_float = qdata.to(compute_dtype) * w_scale_2d.to(compute_dtype)
                     if zp is not None:
@@ -511,6 +543,19 @@ def make_intcrush_ops(
                                              * w_scale_2d.to(compute_dtype))
                     out = F.linear(x_2d, w_float, bias)
                     del x_2d, w_float
+                elif _tr.USE_FUSED_W8A8 and _tr.TRITON_FUSED_QGD:
+                    # Fused single-kernel: quantize fp16→int8 + GEMM + dequant.
+                    needs_zp = zp is not None
+                    x_2d_sum = x_2d.sum(dim=-1, keepdim=True) if needs_zp else None
+                    out = _tr.fused_quant_int8_gemm_dequant(
+                        x_2d, qdata, w_scale,
+                        bias=bias, out_dtype=compute_dtype,
+                    )
+                    del x_2d
+                    if needs_zp:
+                        scale_flat = w_scale.reshape(-1).float().contiguous()
+                        zp_cor = (scale_flat * zp.reshape(-1).float()).to(out.dtype)
+                        out.addmm_(x_2d_sum, zp_cor.unsqueeze(0), beta=1, alpha=-1)
                 else:
                     # Two-kernel path (quantize → GEMM) is always faster than
                     # the fused quant+GEMM kernel for batch > 16: the fused kernel
@@ -725,6 +770,10 @@ def make_intcrush_ops(
             def set_weight(self, out_weight: torch.Tensor, inplace_update: bool = False, seed: int = 0,
                            return_weight: bool = False, **kwargs: Any) -> torch.Tensor | None:
                 """Requantize float weights, preserving rotation and permutation params."""
+                # Invalidate CUDA graph cache on weight changes.
+                if hasattr(self, '_graph_runner') and self._graph_runner is not None:
+                    self._graph_runner = None
+
                 if not self._intcrush_is_quantized:
                     new_weight = out_weight.to(self.weight.dtype)
                     if return_weight:

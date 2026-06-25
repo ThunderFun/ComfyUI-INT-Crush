@@ -208,17 +208,33 @@ def fused_int8_gemm_dequant(
 # ── Fused quantize + GEMM + dequant (single kernel for small M) ────────────
 
 _configs_fused_qgd = [
-    # These configs are for the fused quantize+GEMM+dequant kernel.
-    # BLOCK_K must be >= K for the single-pass quantize approach,
-    # so we use large BLOCK_K values.
+    # BLOCK_K=64 — low register pressure (two-pass friendly)
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=4, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=4, num_warps=8),
+    # BLOCK_K=128 — better compute density
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=3, num_warps=4),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=3, num_warps=4),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=4, num_warps=8),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=3, num_warps=8),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=4, num_warps=8),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256}, num_stages=3, num_warps=4),
+    # BLOCK_K=256 — max compute density (large K)
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=3, num_warps=4),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 256}, num_stages=3, num_warps=8),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 256}, num_stages=3, num_warps=4),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=3, num_warps=8),
+    # High pipeline stages (deep K pipelining)
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=5, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=6, num_warps=8),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256}, num_stages=5, num_warps=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=5, num_warps=8),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=6, num_warps=8),
 ]
 
 

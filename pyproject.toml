@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "ComfyUI-INT-Crush"
-version = "0.1.0"
+version = "0.1.1"
 description = "INT4/INT8 quantized inference for ComfyUI diffusion models"
 requires-python = ">=3.10"
 dependencies = [
